@@ -135,11 +135,12 @@ def set_secret(key: str, value: str, secrets_file: Path = None) -> None:
         with open(temp_file, "w") as f:
             yaml.dump(secrets, f, default_flow_style=False)
 
-        # Encrypt with sops
+        # Encrypt with sops (specify type since temp file has .tmp extension)
         result = subprocess.run(
-            ["sops", "-e", "-i", str(temp_file)],
+            ["sops", "-e", "-i", "--input-type", "yaml", "--output-type", "yaml", str(temp_file)],
             capture_output=True,
-            text=True
+            text=True,
+            cwd=secrets_file.parent
         )
 
         if result.returncode != 0:
@@ -175,9 +176,10 @@ def delete_secret(key: str, secrets_file: Path = None) -> None:
             yaml.dump(secrets, f, default_flow_style=False)
 
         result = subprocess.run(
-            ["sops", "-e", "-i", str(temp_file)],
+            ["sops", "-e", "-i", "--input-type", "yaml", "--output-type", "yaml", str(temp_file)],
             capture_output=True,
-            text=True
+            text=True,
+            cwd=secrets_file.parent
         )
 
         if result.returncode != 0:
@@ -233,9 +235,9 @@ def init_secrets_file(secrets_file: Path = None, age_recipient: str = None) -> N
             with open(sops_config, "w") as f:
                 f.write(f"creation_rules:\n  - age: {age_recipient}\n")
 
-        # Encrypt
+        # Encrypt (specify input/output type since temp file has .tmp extension)
         result = subprocess.run(
-            ["sops", "-e", "-i", str(temp_file)],
+            ["sops", "-e", "-i", "--input-type", "yaml", "--output-type", "yaml", str(temp_file)],
             capture_output=True,
             text=True,
             cwd=secrets_file.parent
