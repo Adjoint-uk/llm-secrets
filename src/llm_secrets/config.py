@@ -21,18 +21,8 @@ def get_default_secrets_file() -> Path:
     if env_file:
         return Path(env_file).expanduser()
 
-    # Check config dir
-    config_file = get_config_dir() / "secrets.yaml"
-    if config_file.exists():
-        return config_file
-
-    # Fall back to ~/.claude/secrets.yaml for backwards compatibility
-    claude_file = Path.home() / ".claude" / "secrets.yaml"
-    if claude_file.exists():
-        return claude_file
-
-    # Default to config dir
-    return config_file
+    # Default to XDG config dir
+    return get_config_dir() / "secrets.yaml"
 
 
 def get_age_key_file() -> Path:

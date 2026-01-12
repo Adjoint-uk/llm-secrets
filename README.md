@@ -181,7 +181,6 @@ Secrets: 5 keys
 
 - Secrets: `~/.config/llm-secrets/secrets.yaml`
 - Age key: `~/.config/sops/age/keys.txt`
-- Fallback: `~/.claude/secrets.yaml` (backwards compatibility)
 
 ## Age Key Setup
 

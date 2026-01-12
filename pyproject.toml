@@ -52,5 +52,11 @@ packages = ["src/llm_secrets"]
 [tool.hatch.build.targets.sdist]
 include = [
     "/src",
+    "/tests",
     "/README.md",
+    "/LICENSE",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
