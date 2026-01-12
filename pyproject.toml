@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 authors = [
-    { name = "cptfinch" }
+    { name = "Adjoint Ltd", email = "hello@adjoint.uk" }
 ]
 keywords = ["secrets", "sops", "age", "llm", "ai", "agent", "security", "encryption"]
 classifiers = [
@@ -42,9 +42,9 @@ llm-secrets = "llm_secrets.cli:main"
 llms = "llm_secrets.cli:main"
 
 [project.urls]
-Documentation = "https://github.com/cptfinch/llm-secrets#readme"
-Source = "https://github.com/cptfinch/llm-secrets"
-Issues = "https://github.com/cptfinch/llm-secrets/issues"
+Documentation = "https://github.com/adjoint-uk/llm-secrets#readme"
+Source = "https://github.com/adjoint-uk/llm-secrets"
+Issues = "https://github.com/adjoint-uk/llm-secrets/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/llm_secrets"]
