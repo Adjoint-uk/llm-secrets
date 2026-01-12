@@ -38,13 +38,27 @@ pip install llm-secrets
 
 ## Quick Start
 
-```bash
-# Check setup
-llm-secrets status
+### First-Time Setup (one time only)
 
-# Initialize secrets file
+```bash
+# 1. Install dependencies
+sudo apt install sops age    # Debian/Ubuntu
+# or: brew install sops age  # macOS
+
+# 2. Generate your encryption key
+mkdir -p ~/.config/sops/age
+age-keygen -o ~/.config/sops/age/keys.txt
+
+# 3. Initialize secrets file
 llm-secrets init
 
+# 4. Verify setup
+llm-secrets status
+```
+
+### Daily Usage
+
+```bash
 # Add a secret (hidden input - safe)
 llm-secrets set my_api_key
 
@@ -184,18 +198,20 @@ Secrets: 5 keys
 
 ## Age Key Setup
 
-If you don't have an age key:
+If you need to set up encryption keys on a new machine:
 
 ```bash
 # Create key directory
 mkdir -p ~/.config/sops/age
 
-# Generate key pair
+# Generate new key pair
 age-keygen -o ~/.config/sops/age/keys.txt
 
-# View public key (for sharing/backup)
+# View your public key (safe to share/backup)
 age-keygen -y ~/.config/sops/age/keys.txt
 ```
+
+**Important:** Keep your private key (`keys.txt`) secure. Anyone with this key can decrypt your secrets.
 
 ## Security Model
 
