@@ -15,6 +15,7 @@ from .config import DEFAULT_SECRETS_FILE, AGE_KEY_FILE
 from . import secrets
 
 console = Console()
+err_console = Console(stderr=True)
 
 
 def cmd_list(args):
@@ -185,6 +186,15 @@ def cmd_exec(args):
         llm-secrets exec --inject API_KEY=my_api_key -- curl -H "Authorization: $API_KEY" https://api.example.com
     """
     try:
+        # Strip leading '--' separator if present (argparse.REMAINDER includes it)
+        command = args.exec_command
+        if command and command[0] == "--":
+            command = command[1:]
+
+        if not command:
+            err_console.print("[red]Error:[/red] No command specified")
+            return 1
+
         # Build environment with injected secrets
         env = os.environ.copy()
 
@@ -197,14 +207,14 @@ def cmd_exec(args):
             env_var, secret_key = inject.split("=", 1)
             value = secrets.get_secret(secret_key, args.file)
             env[env_var] = value
-            console.print(f"[dim]Injected: {env_var} (from {secret_key})[/dim]", file=sys.stderr)
+            err_console.print(f"[dim]Injected: {env_var} (from {secret_key})[/dim]")
 
         # Run the command
-        result = subprocess.run(args.command, env=env, shell=False)
+        result = subprocess.run(command, env=env, shell=False)
         return result.returncode
 
     except secrets.SecretsError as e:
-        console.print(f"[red]Error:[/red] {e}", file=sys.stderr)
+        err_console.print(f"[red]Error:[/red] {e}")
         return 1
 
 
@@ -348,7 +358,7 @@ Environment:
     exec_parser = subparsers.add_parser("exec", help="Run command with secrets injected")
     exec_parser.add_argument("--inject", action="append", default=[], metavar="ENV=KEY",
                              help="Inject secret as env var (can repeat)")
-    exec_parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to run")
+    exec_parser.add_argument("exec_command", nargs=argparse.REMAINDER, help="Command to run")
 
     args = parser.parse_args()
 
