@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llm-secrets"
-version = "0.1.0"
+version = "0.1.1"
 description = "SOPS wrapper for the AI agent era - manage secrets without leaking them to LLM context"
 readme = "README.md"
 license = "MIT"
