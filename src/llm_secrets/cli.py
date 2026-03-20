@@ -102,12 +102,20 @@ def cmd_set(args):
     Set a secret value via hidden input (safe - not in shell history).
 
     The value is read from:
-    1. --value flag (NOT recommended - visible in shell history)
-    2. --from-file (reads from file, then deletes file)
-    3. Interactive hidden prompt (recommended)
+    1. stdin pipe (echo 'val' | llms set key — safe, no shell escaping)
+    2. --value flag (NOT recommended - visible in shell history)
+    3. --from-file (reads from file, then deletes file)
+    4. Interactive hidden prompt (recommended)
     """
     try:
-        if args.value:
+        if not sys.stdin.isatty() and not args.value and not args.from_file:
+            # Reading from pipe — safest for special characters
+            value = sys.stdin.read().strip()
+            if not value:
+                console.print("[red]Error:[/red] Empty value from stdin")
+                return 1
+
+        elif args.value:
             # Direct value (not recommended but useful for scripts)
             value = args.value
             console.print("[yellow]Warning:[/yellow] Value visible in shell history")
