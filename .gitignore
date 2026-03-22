@@ -39,3 +39,8 @@ htmlcov/
 # Distribution
 *.tar.gz
 *.whl
+
+
+# Added by cargo
+
+/target
