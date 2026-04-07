@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- **Functional v0.2 commands** — `init`, `list`, `peek`, `set`, `delete`, `status`, `exec` are all implemented against an age-encrypted on-disk store. Closes #1.
+- `set --stdin` reads the value from stdin (handy for pipes and scripted setup).
+- ADR 0003 — on-disk store layout (single-file age-encrypted JSON).
+- 14 tests covering masking, in-memory store ops, init/list/peek/set/delete round-trip, exec env injection, and CLI invariants.
 - Issue and PR templates, code of conduct, CI badge.
 - ADR 0001 — Rust rewrite rationale.
 - ADR 0002 — architectural removal of the `get` command.

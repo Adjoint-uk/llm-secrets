@@ -1,5 +1,6 @@
 mod cli;
 mod error;
+mod store;
 
 fn main() {
     if let Err(e) = cli::run() {

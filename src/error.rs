@@ -1,9 +1,5 @@
 use thiserror::Error;
 
-// Variants are declared up-front so the surface is visible and CI doesn't
-// thrash as commands are wired up. Remove this allow once every variant is
-// constructed somewhere (target: end of v0.2).
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("secrets store not found — run `llms init` first")]
@@ -18,12 +14,18 @@ pub enum Error {
     #[error("decryption error: {0}")]
     Decryption(String),
 
+    // Reserved for v0.3 (#5). Allowed dead until the policy engine lands.
+    #[allow(dead_code)]
     #[error("policy denied access to '{key}': {reason}")]
     PolicyDenied { key: String, reason: String },
 
+    // Reserved for v0.4 (#7).
+    #[allow(dead_code)]
     #[error("lease expired: {0}")]
     LeaseExpired(String),
 
+    // Reserved for v0.3 (#4).
+    #[allow(dead_code)]
     #[error("session not active — run `llms session-start` first")]
     NoSession,
 
