@@ -3,6 +3,7 @@ mod cli;
 mod error;
 mod identity;
 mod lease;
+mod mcp;
 mod policy;
 mod store;
 

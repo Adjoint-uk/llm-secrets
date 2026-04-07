@@ -112,6 +112,10 @@ enum Command {
         #[arg(long)]
         rotate: bool,
     },
+
+    /// Run as an MCP (Model Context Protocol) server on stdio. Exposes a
+    /// safe subset of the CLI to AI agents — never returns plaintext.
+    Mcp,
 }
 
 pub fn run() -> Result<()> {
@@ -131,6 +135,7 @@ pub fn run() -> Result<()> {
         Command::Leases => cmd_leases(),
         Command::Audit { json, last } => cmd_audit(json, last),
         Command::RevokeAll { rotate } => cmd_revoke_all(rotate),
+        Command::Mcp => crate::mcp::serve(),
     }
 }
 

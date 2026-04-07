@@ -270,6 +270,54 @@ fn lease_grant_list_and_revoke() {
 }
 
 #[test]
+fn mcp_initialize_lists_tools_and_never_returns_plaintext() {
+    let dir = fresh_store();
+    let env_dir = dir.path();
+
+    // Seed a secret so list_secrets has something to find.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["set", "api_key", "--stdin"])
+        .write_stdin("super-secret-do-not-leak")
+        .assert()
+        .success();
+
+    // Pipeline of MCP requests on stdin: initialize, tools/list,
+    // tools/call list_secrets, tools/call peek_secret.
+    let input = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_secrets","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"peek_secret","arguments":{"key":"api_key"}}}"#,
+    ]
+    .join("\n");
+
+    let output = llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .arg("mcp")
+        .write_stdin(input)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+
+    // Initialize advertised the protocol version.
+    assert!(stdout.contains("protocolVersion"), "stdout: {stdout}");
+    // tools/list returned our tools (no `get_secret`).
+    assert!(stdout.contains("list_secrets"), "stdout: {stdout}");
+    assert!(stdout.contains("peek_secret"), "stdout: {stdout}");
+    assert!(!stdout.contains("get_secret"), "MCP exposed a get tool!");
+    // list_secrets returned the key name.
+    assert!(stdout.contains("api_key"));
+    // peek_secret returned a mask, NOT the plaintext.
+    assert!(
+        !stdout.contains("super-secret-do-not-leak"),
+        "MCP leaked plaintext: {stdout}"
+    );
+    assert!(stdout.contains("*"));
+}
+
+#[test]
 fn audit_with_no_entries_is_clean() {
     let dir = fresh_store();
     llms()

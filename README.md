@@ -144,14 +144,15 @@ Without a policy file, all secrets are accessible (backwards compatible).
 - **Temporal bounds**: leases expire, killswitch revokes all
 - **Audit trail**: append-only JSONL log of every access
 
-## Roadmap
+## Documentation
 
-See [milestones](https://github.com/adjoint-uk/llm-secrets/milestones) for the full plan:
+- [Usage walkthrough](docs/USAGE.md) — every command with examples
+- [Security model](docs/SECURITY-MODEL.md) — threat model + architectural guarantees
+- [ADRs](docs/adr/) — design decisions, including why there is no `get` command
 
-- **v0.2** — Age encryption, no SOPS dependency, Rust rewrite
-- **v0.3** — Session identity, attestation, policy engine
-- **v0.4** — Leases, audit log, killswitch
-- **v1.0** — MCP server, CI/CD, docs, crates.io release
+## Status
+
+**v1.0 — released.** The Rust binary implements the full workload identity model: encrypted store, session attestation, policy engine, leases, audit log, killswitch, and MCP server mode. See the [CHANGELOG](CHANGELOG.md) for the milestone breakdown.
 
 ## Contributing
 
