@@ -1,5 +1,9 @@
 use thiserror::Error;
 
+// Variants are declared up-front so the surface is visible and CI doesn't
+// thrash as commands are wired up. Remove this allow once every variant is
+// constructed somewhere (target: end of v0.2).
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("secrets store not found — run `llms init` first")]
