@@ -1,5 +1,8 @@
 # llm-secrets
 
+[![CI](https://github.com/adjoint-uk/llm-secrets/actions/workflows/ci.yml/badge.svg)](https://github.com/adjoint-uk/llm-secrets/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Workload identity for AI agents — prove who you are, access only what you should, for only as long as you need.
 
 ## The Problem

@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest a new capability or change
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening, please check existing [issues](https://github.com/adjoint-uk/llm-secrets/issues) and [milestones](https://github.com/adjoint-uk/llm-secrets/milestones).
+
+        **Note:** `llm-secrets` will never have a `get` command (see [ADR 0002](../docs/adr/0002-no-get-command.md)). Requests for one will be closed as `wontfix`.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you can't do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: principles
+    attributes:
+      label: Architectural fit
+      description: Does this reinforce workload identity and architectural enforcement? (See CONTRIBUTING.md → Design Principles.)
+      options:
+        - "Yes — strengthens identity / enforcement"
+        - "Neutral — orthogonal to identity model"
+        - "Unsure — would like feedback"
+    validations:
+      required: true

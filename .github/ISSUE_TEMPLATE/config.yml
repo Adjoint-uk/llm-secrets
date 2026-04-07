@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/adjoint-uk/llm-secrets/blob/main/SECURITY.md
+    about: Do not file public issues for security bugs. Email security@adjoint.uk.
+  - name: Question / discussion
+    url: https://github.com/adjoint-uk/llm-secrets/discussions
+    about: For open-ended questions about workload identity, design, or usage.
