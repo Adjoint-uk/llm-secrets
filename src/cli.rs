@@ -125,14 +125,8 @@ pub fn run() -> Result<()> {
         Command::Delete { key, force } => cmd_delete(&key, force),
         Command::Exec { inject, command } => cmd_exec(inject, command),
         Command::Status => cmd_status(),
-        Command::SessionStart { ttl } => {
-            println!("TODO: start session (ttl={ttl})");
-            Ok(())
-        }
-        Command::SessionInfo => {
-            println!("TODO: show session info");
-            Ok(())
-        }
+        Command::SessionStart { ttl } => cmd_session_start(&ttl),
+        Command::SessionInfo => cmd_session_info(),
         Command::Lease { key, ttl } => {
             println!("TODO: create lease for {key} (ttl={ttl})");
             Ok(())
@@ -178,6 +172,7 @@ fn cmd_list() -> Result<()> {
 }
 
 fn cmd_peek(key: &str, chars: usize) -> Result<()> {
+    crate::policy::check_access(key)?;
     let identity = store::load_identity()?;
     let store = store::load_store(&identity)?;
     let value = store
@@ -291,6 +286,7 @@ fn cmd_exec(inject: Vec<String>, command: Vec<String>) -> Result<()> {
         let (env_var, secret_key) = spec
             .split_once('=')
             .ok_or_else(|| Error::Other(format!("invalid --inject {spec:?}, expected ENV=key")))?;
+        crate::policy::check_access(secret_key)?;
         let value = store
             .get(secret_key)
             .ok_or_else(|| Error::KeyNotFound(secret_key.to_string()))?;
@@ -310,4 +306,60 @@ fn cmd_exec(inject: Vec<String>, command: Vec<String>) -> Result<()> {
         std::process::exit(code);
     }
     Ok(())
+}
+
+// ---- v0.3 command implementations -----------------------------------------
+
+fn cmd_session_start(ttl: &str) -> Result<()> {
+    let dur = crate::identity::parse_duration(ttl)?;
+    // Make sure the store dir exists, even if init hasn't run yet — sessions
+    // can be opened independently.
+    std::fs::create_dir_all(crate::store::store_dir()?)?;
+
+    let claims = crate::identity::Claims::gather(dur);
+    let session = crate::identity::Session::new(claims)?;
+    crate::identity::save_session(&session)?;
+
+    println!("session started");
+    print_claims(&session);
+    println!();
+    println!("expires: {}", session.claims.expires_at.to_rfc3339());
+    Ok(())
+}
+
+fn cmd_session_info() -> Result<()> {
+    let session = crate::identity::load_session()?;
+    match session.verify() {
+        Ok(()) => println!("signature: valid"),
+        Err(e) => {
+            println!("signature: INVALID — {e}");
+            return Err(e);
+        }
+    }
+    if session.is_expired() {
+        println!(
+            "status:    EXPIRED at {}",
+            session.claims.expires_at.to_rfc3339()
+        );
+    } else {
+        println!(
+            "status:    active until {}",
+            session.claims.expires_at.to_rfc3339()
+        );
+    }
+    print_claims(&session);
+    Ok(())
+}
+
+fn print_claims(session: &crate::identity::Session) {
+    let c = &session.claims;
+    println!("  who:    {}", or_dash(&c.who));
+    println!("  repo:   {}", or_dash(&c.repo));
+    println!("  branch: {}", or_dash(&c.branch));
+    println!("  agent:  {}", or_dash(&c.agent));
+    println!("  pid:    {}", c.pid);
+}
+
+fn or_dash(s: &str) -> &str {
+    if s.is_empty() { "-" } else { s }
 }

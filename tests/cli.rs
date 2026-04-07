@@ -188,6 +188,38 @@ fn list_without_init_errors() {
 }
 
 #[test]
+fn session_start_and_info_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .args(["session-start", "--ttl", "1h"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session started"));
+
+    assert!(dir.path().join("session.json").exists());
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .arg("session-info")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("signature: valid"))
+        .stdout(predicate::str::contains("active until"));
+}
+
+#[test]
+fn session_info_without_session_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .arg("session-info")
+        .assert()
+        .failure();
+}
+
+#[test]
 fn exec_with_missing_command_after_dash_dash_errors() {
     let dir = fresh_store();
     llms()

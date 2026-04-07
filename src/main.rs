@@ -1,5 +1,8 @@
+mod agent;
 mod cli;
 mod error;
+mod identity;
+mod policy;
 mod store;
 
 fn main() {
