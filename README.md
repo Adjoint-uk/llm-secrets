@@ -1,262 +1,159 @@
 # llm-secrets
 
-SOPS wrapper for the AI agent era - manage secrets without leaking them to LLM context.
+Workload identity for AI agents — prove who you are, access only what you should, for only as long as you need.
 
 ## The Problem
 
-When using AI coding assistants (Claude Code, Copilot, Cursor), secrets can leak into:
-- Chat history and logs
-- Shell command history
-- LLM context windows (visible to the model)
+AI coding agents (Claude Code, Cursor, Copilot) run with your full identity. They can read `.env` files, environment variables, and anything in your filesystem. There's no boundary between what the agent needs and what it can see.
 
-Traditional secret management tools output full values, which get captured by LLMs.
+Existing tools either:
+- **Output raw secrets** that get captured in LLM context (`.env`, `sops`, `doppler run`)
+- **Use proxy daemons** that add operational complexity (agentsecrets, agent-secrets)
+- **Rely on honour systems** — telling the agent "don't look" isn't security
 
-## The Solution
+## The Approach
 
-`llm-secrets` provides LLM-safe secret operations:
+`llm-secrets` applies the **workload identity** pattern — the same model used by AWS IAM Roles Anywhere, SPIFFE, and HashiCorp Vault WIF — to AI coding agents.
 
-| Command | LLM Safe? | Use Case |
-|---------|-----------|----------|
-| `list` | Yes | Show available secret keys (no values) |
-| `peek` | Yes | View masked secret (`sk-12****cdef`) |
-| `set` | Yes | Add secret via hidden input |
-| `exec` | Yes | Run command with secrets injected |
-| `get` | **No** | Retrieve full value (scripts only) |
+The agent doesn't manage secrets. It **proves what it is**, and a policy engine decides what it can access:
+
+```
+Agent starts session → attestation signed:
+  who:   cptfinch (from git config)
+  where: adjoint-uk/billing, branch main
+  what:  Claude Code, pid 12345
+  when:  2026-03-22T11:00:00Z
+
+Agent requests secret → policy evaluated:
+  db_password → allowed (repo match, user match, TTL 5m)
+  stripe_key  → denied  (wrong repo)
+```
+
+**There is no `get` command.** This is architectural enforcement, not a convention.
 
 ## Installation
 
 ```bash
-# Requires: sops, age
-sudo apt install sops age  # Debian/Ubuntu
-brew install sops age      # macOS
+cargo install llm-secrets
+```
 
-# Install llm-secrets
-uv pip install llm-secrets
-# or
-pip install llm-secrets
+Or build from source:
+
+```bash
+git clone https://github.com/adjoint-uk/llm-secrets.git
+cd llm-secrets
+cargo build --release
 ```
 
 ## Quick Start
 
-### First-Time Setup (one time only)
-
 ```bash
-# 1. Install dependencies
-sudo apt install sops age    # Debian/Ubuntu
-# or: brew install sops age  # macOS
+# Initialise (generates age keypair)
+llms init
 
-# 2. Generate your encryption key
-mkdir -p ~/.config/sops/age
-age-keygen -o ~/.config/sops/age/keys.txt
+# Store a secret (hidden input)
+llms set db_password
 
-# 3. Initialize secrets file
-llm-secrets init
+# List keys (no values)
+llms list
 
-# 4. Verify setup
-llm-secrets status
-```
+# Masked preview
+llms peek db_password
+# → db_pa****word
 
-### Daily Usage
+# Run a command with secrets injected
+llms exec --inject DB_PASS=db_password -- psql -U admin mydb
 
-```bash
-# Add a secret (hidden input - safe)
-llm-secrets set my_api_key
-
-# List keys (safe for LLM)
-llm-secrets list
-
-# Peek at value (safe for LLM)
-llm-secrets peek my_api_key
-# Output: my_api_key: sk-12********cdef
-
-# Run command with secret injected
-llm-secrets exec --inject API_KEY=my_api_key -- curl -H "Authorization: $API_KEY" https://api.example.com
+# Check status
+llms status
 ```
 
 ## Commands
 
-### `llm-secrets list`
+### Core (v0.2)
 
-List all secret keys. Safe for LLM context.
+| Command | Description | LLM Safe |
+|---------|-------------|----------|
+| `llms init` | Initialise secrets store with age encryption | Yes |
+| `llms list` | List secret keys (names only) | Yes |
+| `llms peek <key>` | Masked preview of a value | Yes |
+| `llms set <key>` | Store secret via hidden input | Yes |
+| `llms delete <key>` | Remove a secret | Yes |
+| `llms exec --inject VAR=key -- cmd` | Run command with secrets injected | Yes |
+| `llms status` | Check store and dependencies | Yes |
 
-```bash
-$ llm-secrets list
-┌─────────────────────────────┬───────────┐
-│ Key                         │ Status    │
-├─────────────────────────────┼───────────┤
-│ anthropic_api_key           │ available │
-│ github_token                │ available │
-│ _example                    │ internal  │
-└─────────────────────────────┴───────────┘
-Total: 3 secrets
+### Agent Identity (v0.3)
+
+| Command | Description |
+|---------|-------------|
+| `llms session-start` | Start authenticated session with attestation |
+| `llms session-info` | Show current session identity |
+
+### Temporal Enforcement (v0.4)
+
+| Command | Description |
+|---------|-------------|
+| `llms lease <key> --ttl 5m` | Request time-bounded secret access |
+| `llms leases` | List active leases |
+| `llms audit` | View access audit log |
+| `llms revoke-all` | Emergency killswitch |
+
+## Policy File
+
+Create `.llm-secrets-policy.yaml` in your repo to control access by identity:
+
+```yaml
+secrets:
+  db_password:
+    allow:
+      - repo: adjoint-uk/billing
+        branch: [main, develop]
+        user: cptfinch
+        max_ttl: 10m
+    deny:
+      - branch: "*"  # deny by default
+
+  stripe_key:
+    allow:
+      - repo: adjoint-uk/billing
+        user: cptfinch
+        max_ttl: 5m
 ```
 
-### `llm-secrets peek <key>`
+Without a policy file, all secrets are accessible (backwards compatible).
 
-View masked secret value. Safe for LLM context.
+## How It Compares
 
-```bash
-$ llm-secrets peek github_token
-github_token: ghp_****************************cdef
-Length: 40 chars
-```
-
-Options:
-- `-c, --chars N` - Show N chars at start/end (default: 4)
-
-### `llm-secrets set <key>`
-
-Add or update a secret. Uses hidden input by default.
-
-```bash
-$ llm-secrets set my_secret
-Setting secret: my_secret
-Enter value (hidden):
-Confirm value (hidden):
-Set: my_secret = sk-1****5678
-```
-
-Options:
-- `--value VALUE` - Set directly (NOT recommended - visible in history)
-- `--from-file PATH` - Read from file
-- `--delete-file` - Delete source file after reading
-
-### `llm-secrets get <key>`
-
-Get full secret value. **NOT safe for LLM context**.
-
-```bash
-# Only use in scripts that pipe the output
-TOKEN=$(llm-secrets get github_token)
-```
-
-### `llm-secrets exec`
-
-Run a command with secrets injected as environment variables.
-
-```bash
-# Single secret
-llm-secrets exec --inject GH_TOKEN=github_token -- gh pr list
-
-# Multiple secrets
-llm-secrets exec \
-  --inject AWS_ACCESS_KEY_ID=aws_key \
-  --inject AWS_SECRET_ACCESS_KEY=aws_secret \
-  -- aws s3 ls
-```
-
-### `llm-secrets delete <key>`
-
-Delete a secret.
-
-```bash
-$ llm-secrets delete old_api_key
-Delete: old_api_key = sk-1****5678
-Type 'yes' to confirm: yes
-Deleted: old_api_key
-```
-
-### `llm-secrets init`
-
-Initialize a new secrets file.
-
-```bash
-$ llm-secrets init
-Initialized: ~/.config/llm-secrets/secrets.yaml
-```
-
-### `llm-secrets status`
-
-Show status and configuration.
-
-```bash
-$ llm-secrets status
-┌──────────────┬───────────┬─────────────────────────────────────────┐
-│ Component    │ Status    │ Path/Info                               │
-├──────────────┼───────────┼─────────────────────────────────────────┤
-│ sops         │ installed │                                         │
-│ age          │ installed │                                         │
-│ secrets file │ exists    │ /home/user/.config/llm-secrets/secrets  │
-│ age key      │ exists    │ /home/user/.config/sops/age/keys.txt    │
-└──────────────┴───────────┴─────────────────────────────────────────┘
-Secrets: 5 keys
-```
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `LLM_SECRETS_FILE` | Override default secrets file path |
-| `SOPS_AGE_KEY_FILE` | Override age key location |
-
-### Default Paths
-
-- Secrets: `~/.config/llm-secrets/secrets.yaml`
-- Age key: `~/.config/sops/age/keys.txt`
-
-## Age Key Setup
-
-If you need to set up encryption keys on a new machine:
-
-```bash
-# Create key directory
-mkdir -p ~/.config/sops/age
-
-# Generate new key pair
-age-keygen -o ~/.config/sops/age/keys.txt
-
-# View your public key (safe to share/backup)
-age-keygen -y ~/.config/sops/age/keys.txt
-```
-
-**Important:** Keep your private key (`keys.txt`) secure. Anyone with this key can decrypt your secrets.
+| | llm-secrets | agentsecrets | agent-secrets | sops / doppler |
+|---|---|---|---|---|
+| **Enforcement** | Architectural (no get command) | Proxy intercept | Lease expiry | None |
+| **Identity model** | Workload attestation | None | None | None |
+| **Policy** | Declarative YAML | Domain allowlist | None | IAM policies |
+| **Access model** | Time-bounded leases | Persistent proxy | Session leases | Static |
+| **Language** | Rust | Go | Go | Go |
+| **Dependencies** | Single binary | Go + OS keychain | Go + age | Multiple |
 
 ## Security Model
 
-- Secrets encrypted at rest using SOPS + age
-- `peek` only shows first/last N characters
-- `set` uses hidden input (not in shell history)
-- `exec` injects secrets without exposing them
-- `get` is the only command that outputs full values
+- **Encryption at rest**: age (X25519 + ChaCha20-Poly1305)
+- **Session identity**: Ed25519 ephemeral keypairs with attestation
+- **No raw output**: secrets only enter subprocess environments, never stdout
+- **Temporal bounds**: leases expire, killswitch revokes all
+- **Audit trail**: append-only JSONL log of every access
 
-## Python API
+## Roadmap
 
-```python
-from llm_secrets import secrets
+See [milestones](https://github.com/adjoint-uk/llm-secrets/milestones) for the full plan:
 
-# List keys (safe)
-keys = secrets.list_keys()
+- **v0.2** — Age encryption, no SOPS dependency, Rust rewrite
+- **v0.3** — Session identity, attestation, policy engine
+- **v0.4** — Leases, audit log, killswitch
+- **v1.0** — MCP server, CI/CD, docs, crates.io release
 
-# Peek at value (safe)
-masked = secrets.peek_secret("api_key")
-print(masked)  # sk-12********cdef
+## Contributing
 
-# Get full value (unsafe - use carefully)
-value = secrets.get_secret("api_key")
-
-# Set a secret
-secrets.set_secret("new_key", "secret_value")
-
-# Delete a secret
-secrets.delete_secret("old_key")
-```
-
-## Use with Claude Code
-
-When working with AI assistants:
-
-```bash
-# Safe commands (LLM can see output):
-llm-secrets list
-llm-secrets peek my_key
-llm-secrets status
-
-# Unsafe commands (don't run in chat):
-llm-secrets get my_key  # Full secret exposed!
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
