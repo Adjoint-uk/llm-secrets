@@ -210,6 +210,77 @@ fn session_start_and_info_round_trip() {
 }
 
 #[test]
+fn lease_grant_list_and_revoke() {
+    let dir = fresh_store();
+    let env_dir = dir.path();
+
+    // Need a session first.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["session-start", "--ttl", "1h"])
+        .assert()
+        .success();
+
+    // Grant a lease.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["lease", "db_password", "--ttl", "5m"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("granted lease"));
+
+    // It shows up in `leases`.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .arg("leases")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("db_password"));
+
+    // Audit log has the grant entry.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .arg("audit")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("lease.grant"))
+        .stdout(predicate::str::contains("db_password"));
+
+    // Killswitch.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .arg("revoke-all")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("revoked 1 leases"));
+
+    // Leases empty afterwards, session gone.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .arg("leases")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(no active leases)"));
+
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .arg("session-info")
+        .assert()
+        .failure();
+}
+
+#[test]
+fn audit_with_no_entries_is_clean() {
+    let dir = fresh_store();
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .arg("audit")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(no audit entries)"));
+}
+
+#[test]
 fn session_info_without_session_errors() {
     let dir = tempfile::tempdir().unwrap();
     llms()

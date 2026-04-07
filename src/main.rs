@@ -2,6 +2,7 @@ mod agent;
 mod cli;
 mod error;
 mod identity;
+mod lease;
 mod policy;
 mod store;
 

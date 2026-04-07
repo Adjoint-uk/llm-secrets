@@ -127,22 +127,10 @@ pub fn run() -> Result<()> {
         Command::Status => cmd_status(),
         Command::SessionStart { ttl } => cmd_session_start(&ttl),
         Command::SessionInfo => cmd_session_info(),
-        Command::Lease { key, ttl } => {
-            println!("TODO: create lease for {key} (ttl={ttl})");
-            Ok(())
-        }
-        Command::Leases => {
-            println!("TODO: list active leases");
-            Ok(())
-        }
-        Command::Audit { json, last } => {
-            println!("TODO: show audit log (json={json}, last={last})");
-            Ok(())
-        }
-        Command::RevokeAll { rotate } => {
-            println!("TODO: revoke all leases (rotate={rotate})");
-            Ok(())
-        }
+        Command::Lease { key, ttl } => cmd_lease(&key, &ttl),
+        Command::Leases => cmd_leases(),
+        Command::Audit { json, last } => cmd_audit(json, last),
+        Command::RevokeAll { rotate } => cmd_revoke_all(rotate),
     }
 }
 
@@ -179,7 +167,17 @@ fn cmd_peek(key: &str, chars: usize) -> Result<()> {
         .get(key)
         .ok_or_else(|| Error::KeyNotFound(key.to_string()))?;
     println!("{}", store::mask(value, chars));
+    audit_if_session("peek", key);
     Ok(())
+}
+
+/// Best-effort audit. We deliberately swallow errors here so that audit
+/// failures don't break the access path; the calling shell still sees the
+/// secret. (`revoke-all` audits with stricter semantics.)
+fn audit_if_session(event: &str, key: &str) {
+    if let Ok(session) = crate::identity::active_session() {
+        let _ = crate::lease::audit(event, key, &session.claims, None);
+    }
 }
 
 fn cmd_set(key: &str, from_stdin: bool) -> Result<()> {
@@ -291,6 +289,7 @@ fn cmd_exec(inject: Vec<String>, command: Vec<String>) -> Result<()> {
             .get(secret_key)
             .ok_or_else(|| Error::KeyNotFound(secret_key.to_string()))?;
         process.env(env_var, value);
+        audit_if_session("exec.inject", secret_key);
     }
 
     // Drop the decrypted store before exec'ing the child so plaintext lives
@@ -362,4 +361,76 @@ fn print_claims(session: &crate::identity::Session) {
 
 fn or_dash(s: &str) -> &str {
     if s.is_empty() { "-" } else { s }
+}
+
+// ---- v0.4 command implementations -----------------------------------------
+
+fn cmd_lease(key: &str, ttl: &str) -> Result<()> {
+    crate::policy::check_access(key)?;
+    let dur = crate::identity::parse_duration(ttl)?;
+    let lease = crate::lease::grant(key, dur)?;
+    println!("granted lease for {key}");
+    println!("  expires: {}", lease.expires_at.to_rfc3339());
+    Ok(())
+}
+
+fn cmd_leases() -> Result<()> {
+    let mut set = crate::lease::LeaseSet::load()?;
+    let pruned = set.prune();
+    if pruned > 0 {
+        set.save()?;
+    }
+    if set.leases.is_empty() {
+        println!("(no active leases)");
+        return Ok(());
+    }
+    for l in &set.leases {
+        println!(
+            "{}  expires {}  by {}",
+            l.key,
+            l.expires_at.to_rfc3339(),
+            or_dash(&l.session_who),
+        );
+    }
+    Ok(())
+}
+
+fn cmd_audit(json: bool, last: usize) -> Result<()> {
+    let entries = crate::lease::read_recent(last)?;
+    if entries.is_empty() {
+        println!("(no audit entries)");
+        return Ok(());
+    }
+    if json {
+        for e in &entries {
+            println!(
+                "{}",
+                serde_json::to_string(e)
+                    .map_err(|err| Error::Other(format!("audit serialise: {err}")))?
+            );
+        }
+    } else {
+        for e in &entries {
+            println!(
+                "{}  {:12}  {:20}  {}  {}",
+                e.at.to_rfc3339(),
+                e.event,
+                e.key,
+                or_dash(&e.who),
+                e.note.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_revoke_all(rotate: bool) -> Result<()> {
+    if rotate {
+        return Err(Error::Other(
+            "--rotate is not implemented yet (planned for v1.0)".into(),
+        ));
+    }
+    let count = crate::lease::revoke_all()?;
+    println!("revoked {count} leases and any active session");
+    Ok(())
 }
