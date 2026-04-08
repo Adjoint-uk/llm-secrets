@@ -245,59 +245,51 @@ fn cmd_list() -> Result<()> {
 }
 
 fn cmd_peek(key: &str, chars: usize, macaroon: Option<String>) -> Result<()> {
-    crate::policy::check_access(key)?;
-    check_macaroon(&macaroon, key)?;
+    let ctx = gate(key, &macaroon)?;
     let identity = store::load_identity()?;
     let store = store::load_store(&identity)?;
     let value = store
         .get(key)
         .ok_or_else(|| Error::KeyNotFound(key.to_string()))?;
     println!("{}", store::mask(value, chars));
-    audit_if_session(
-        if macaroon_was_used(&macaroon) {
-            "peek.macaroon"
+    let _ = crate::lease::audit(
+        if macaroon.is_some() || std::env::var("LLM_SECRETS_MACAROON").is_ok() {
+            "peek.delegated"
         } else {
             "peek"
         },
-        key,
+        &ctx,
+        None,
     );
     Ok(())
 }
 
-/// If a macaroon is presented (via `--macaroon` or `LLM_SECRETS_MACAROON`),
-/// verify its signature against the active session's root key and check
-/// every caveat against the request context. Returns Ok(()) if no macaroon
-/// is presented at all (the v1.0 path is unchanged).
+/// The v2.0 read gate: every operation that reads a secret value travels
+/// through this. Returns the verified `Context` for downstream auditing.
 ///
-/// **A macaroon never bypasses policy** — it can only further restrict.
-/// Both checks must pass.
-fn check_macaroon(flag: &Option<String>, key: &str) -> Result<()> {
-    let Some(encoded) = crate::macaroon::pick_macaroon(flag) else {
-        return Ok(());
-    };
-    let m = crate::macaroon::Macaroon::decode(&encoded)?;
-    let session = crate::identity::active_session().map_err(|_| Error::PolicyDenied {
-        key: key.to_string(),
-        reason: "macaroon presented but no active session".into(),
-    })?;
-    let ctx = crate::macaroon::Context {
-        key,
-        claims: &session.claims,
-    };
-    m.verify(&ctx)
-}
+/// 1. Build the current context from the environment.
+/// 2. Run the optional policy file check.
+/// 3. Verify a macaroon — either the **explicit** one passed via
+///    `--macaroon`/`LLM_SECRETS_MACAROON` (the agent-delegation path), or
+///    the dev's **root macaroon** loaded from `session.json` (the
+///    direct-CLI path). One of the two must verify.
+///
+/// There is no "no macaroon" path. If neither an explicit nor a root
+/// macaroon is available, the operation fails closed with a clear error.
+fn gate<'a>(key: &'a str, flag: &Option<String>) -> Result<crate::macaroon::Context<'a>> {
+    let ctx = crate::macaroon::Context::current(key);
+    crate::policy::check_access(&ctx)?;
 
-fn macaroon_was_used(flag: &Option<String>) -> bool {
-    crate::macaroon::pick_macaroon(flag).is_some()
-}
-
-/// Best-effort audit. We deliberately swallow errors here so that audit
-/// failures don't break the access path; the calling shell still sees the
-/// secret. (`revoke-all` audits with stricter semantics.)
-fn audit_if_session(event: &str, key: &str) {
-    if let Ok(session) = crate::identity::active_session() {
-        let _ = crate::lease::audit(event, key, &session.claims, None);
-    }
+    let m = if let Some(encoded) = crate::macaroon::pick_macaroon(flag) {
+        crate::macaroon::Macaroon::decode(&encoded)?
+    } else {
+        crate::macaroon::Macaroon::load_root().map_err(|_| Error::PolicyDenied {
+            key: key.to_string(),
+            reason: "no active session and no macaroon presented — run `llms session-start`".into(),
+        })?
+    };
+    m.verify(&ctx)?;
+    Ok(ctx)
 }
 
 fn cmd_set(key: &str, from_stdin: bool) -> Result<()> {
@@ -400,24 +392,23 @@ fn cmd_exec(inject: Vec<String>, macaroon: Option<String>, command: Vec<String>)
     let mut process = ProcessCommand::new(&command[0]);
     process.args(&command[1..]);
 
+    let delegated = macaroon.is_some() || std::env::var("LLM_SECRETS_MACAROON").is_ok();
+    let event = if delegated {
+        "exec.inject.delegated"
+    } else {
+        "exec.inject"
+    };
+
     for spec in &inject {
         let (env_var, secret_key) = spec
             .split_once('=')
             .ok_or_else(|| Error::Other(format!("invalid --inject {spec:?}, expected ENV=key")))?;
-        crate::policy::check_access(secret_key)?;
-        check_macaroon(&macaroon, secret_key)?;
+        let ctx = gate(secret_key, &macaroon)?;
         let value = store
             .get(secret_key)
             .ok_or_else(|| Error::KeyNotFound(secret_key.to_string()))?;
         process.env(env_var, value);
-        audit_if_session(
-            if macaroon_was_used(&macaroon) {
-                "exec.inject.macaroon"
-            } else {
-                "exec.inject"
-            },
-            secret_key,
-        );
+        let _ = crate::lease::audit(event, &ctx, None);
     }
 
     // Drop the decrypted store before exec'ing the child so plaintext lives
@@ -435,71 +426,50 @@ fn cmd_exec(inject: Vec<String>, macaroon: Option<String>, command: Vec<String>)
     Ok(())
 }
 
-// ---- v0.3 command implementations -----------------------------------------
+// ---- session commands (v2.0: a session IS a root macaroon) ---------------
 
 fn cmd_session_start(ttl: &str) -> Result<()> {
-    let dur = crate::identity::parse_duration(ttl)?;
-    // Make sure the store dir exists, even if init hasn't run yet — sessions
-    // can be opened independently.
+    let dur = crate::macaroon::parse_duration(ttl)?;
     std::fs::create_dir_all(crate::store::store_dir()?)?;
 
-    let claims = crate::identity::Claims::gather(dur);
-    let session = crate::identity::Session::new(claims)?;
-    crate::identity::save_session(&session)?;
-    // Rotate the macaroon root key — invalidates any previously-derived
-    // macaroons from the prior session.
-    crate::macaroon::rotate_root_key()?;
+    // Mint a fresh root macaroon. This rotates the HMAC root key, gathers
+    // current context as caveats, and saves the macaroon as session.json.
+    let root = crate::macaroon::Macaroon::mint_root(dur)?;
 
     println!("session started");
-    print_claims(&session);
-    println!();
-    println!("expires: {}", session.claims.expires_at.to_rfc3339());
+    print_caveats(&root);
     Ok(())
 }
 
 fn cmd_session_info() -> Result<()> {
-    let session = crate::identity::load_session()?;
-    match session.verify() {
-        Ok(()) => println!("signature: valid"),
+    let root = crate::macaroon::Macaroon::load_root()?;
+    let ctx = crate::macaroon::Context::current("(none)");
+    match root.verify(&ctx) {
+        Ok(()) => println!("status:    active"),
         Err(e) => {
-            println!("signature: INVALID — {e}");
+            println!("status:    INVALID — {e}");
             return Err(e);
         }
     }
-    if session.is_expired() {
-        println!(
-            "status:    EXPIRED at {}",
-            session.claims.expires_at.to_rfc3339()
-        );
-    } else {
-        println!(
-            "status:    active until {}",
-            session.claims.expires_at.to_rfc3339()
-        );
-    }
-    print_claims(&session);
+    print_caveats(&root);
     Ok(())
 }
 
-fn print_claims(session: &crate::identity::Session) {
-    let c = &session.claims;
-    println!("  who:    {}", or_dash(&c.who));
-    println!("  repo:   {}", or_dash(&c.repo));
-    println!("  branch: {}", or_dash(&c.branch));
-    println!("  agent:  {}", or_dash(&c.agent));
-    println!("  pid:    {}", c.pid);
+fn print_caveats(m: &crate::macaroon::Macaroon) {
+    for c in &m.caveats {
+        println!("  - {}", c.describe());
+    }
 }
 
 fn or_dash(s: &str) -> &str {
     if s.is_empty() { "-" } else { s }
 }
 
-// ---- v0.4 command implementations -----------------------------------------
+// ---- lease + audit + killswitch ------------------------------------------
 
 fn cmd_lease(key: &str, ttl: &str, macaroon: Option<String>) -> Result<()> {
-    crate::policy::check_access(key)?;
-    check_macaroon(&macaroon, key)?;
-    let dur = crate::identity::parse_duration(ttl)?;
+    let _ctx = gate(key, &macaroon)?;
+    let dur = crate::macaroon::parse_duration(ttl)?;
     let lease = crate::lease::grant(key, dur)?;
     println!("granted lease for {key}");
     println!("  expires: {}", lease.expires_at.to_rfc3339());
@@ -559,16 +529,16 @@ fn cmd_audit(json: bool, last: usize) -> Result<()> {
 fn cmd_revoke_all(rotate: bool) -> Result<()> {
     if rotate {
         return Err(Error::Other(
-            "--rotate is not implemented yet (planned for v1.0)".into(),
+            "--rotate is reserved for re-encrypting the store under a fresh age key (planned)"
+                .into(),
         ));
     }
     let count = crate::lease::revoke_all()?;
-    crate::macaroon::delete_root_key()?;
-    println!("revoked {count} leases, any active session, and macaroon root key");
+    println!("revoked {count} leases, the root macaroon, and the macaroon root key");
     Ok(())
 }
 
-// ---- v1.1 macaroon command implementations -------------------------------
+// ---- macaroon (delegation) commands --------------------------------------
 
 fn cmd_macaroon_mint(
     secret: Vec<String>,
@@ -578,39 +548,40 @@ fn cmd_macaroon_mint(
     agent: Option<String>,
     who: Option<String>,
 ) -> Result<()> {
-    let dur = crate::identity::parse_duration(ttl)?;
-    let mut caveats: Vec<crate::macaroon::Caveat> = Vec::new();
+    let dur = crate::macaroon::parse_duration(ttl)?;
+    let mut extras: Vec<crate::macaroon::Caveat> = Vec::new();
 
     match secret.len() {
         0 => {
             return Err(Error::Other(
-                "at least one --secret is required (a macaroon with no scope is just a session)"
-                    .into(),
+                "at least one --secret is required (a delegated token with no narrowing is just your root)".into(),
             ));
         }
-        1 => caveats.push(crate::macaroon::Caveat::SecretEq(
+        1 => extras.push(crate::macaroon::Caveat::SecretEq(
             secret.into_iter().next().unwrap(),
         )),
-        _ => caveats.push(crate::macaroon::Caveat::SecretsIn(secret)),
+        _ => extras.push(crate::macaroon::Caveat::SecretsIn(secret)),
     }
 
-    caveats.push(crate::macaroon::Caveat::ExpiresAt(chrono::Utc::now() + dur));
-
+    extras.push(crate::macaroon::Caveat::ExpiresAt(chrono::Utc::now() + dur));
     if let Some(r) = repo {
-        caveats.push(crate::macaroon::Caveat::RepoEq(r));
+        extras.push(crate::macaroon::Caveat::RepoEq(r));
     }
     if let Some(b) = branch {
-        caveats.push(crate::macaroon::Caveat::BranchEq(b));
+        extras.push(crate::macaroon::Caveat::BranchEq(b));
     }
     if let Some(a) = agent {
-        caveats.push(crate::macaroon::Caveat::AgentEq(a));
+        extras.push(crate::macaroon::Caveat::AgentEq(a));
     }
     if let Some(w) = who {
-        caveats.push(crate::macaroon::Caveat::WhoEq(w));
+        extras.push(crate::macaroon::Caveat::WhoEq(w));
     }
 
-    let m = crate::macaroon::Macaroon::mint(caveats)?;
-    println!("{}", m.encode()?);
+    // Delegation derives the child token from the dev's root macaroon.
+    // The agent inherits a *narrower* slice of the dev's identity.
+    let root = crate::macaroon::Macaroon::load_root()?;
+    let child = root.delegate(extras)?;
+    println!("{}", child.encode()?);
     Ok(())
 }
 
@@ -632,12 +603,8 @@ fn cmd_macaroon_inspect(macaroon: Option<String>) -> Result<()> {
 fn cmd_macaroon_verify(macaroon: Option<String>, key: Option<String>) -> Result<()> {
     let encoded = read_macaroon_input(macaroon)?;
     let m = crate::macaroon::Macaroon::decode(&encoded)?;
-    let session = crate::identity::active_session()?;
     let probe_key = key.as_deref().unwrap_or("(unspecified)");
-    let ctx = crate::macaroon::Context {
-        key: probe_key,
-        claims: &session.claims,
-    };
+    let ctx = crate::macaroon::Context::current(probe_key);
     m.verify(&ctx)?;
     println!(
         "ok — signature valid and all {} caveats hold",

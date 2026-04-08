@@ -62,6 +62,13 @@ fn fresh_store() -> TempDir {
         .arg("init")
         .assert()
         .success();
+    // v2.0: every read requires an active session (or a presented macaroon).
+    // Start one in the test fixture so individual tests don't have to.
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .args(["session-start", "--ttl", "1h"])
+        .assert()
+        .success();
     dir
 }
 
@@ -196,17 +203,19 @@ fn session_start_and_info_round_trip() {
         .args(["session-start", "--ttl", "1h"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("session started"));
+        .stdout(predicate::str::contains("session started"))
+        .stdout(predicate::str::contains("expires at"));
 
+    // v2.0: session.json IS a macaroon. root.key is the HMAC root.
     assert!(dir.path().join("session.json").exists());
+    assert!(dir.path().join("root.key").exists());
 
     llms()
         .env("LLM_SECRETS_DIR", dir.path())
         .arg("session-info")
         .assert()
         .success()
-        .stdout(predicate::str::contains("signature: valid"))
-        .stdout(predicate::str::contains("active until"));
+        .stdout(predicate::str::contains("status:    active"));
 }
 
 #[test]

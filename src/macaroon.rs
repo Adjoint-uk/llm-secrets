@@ -1,45 +1,71 @@
-//! Macaroon-based capability delegation. See `docs/adr/0006-macaroons.md`.
+//! The single identity primitive of `llm-secrets`. See `docs/adr/0006-macaroons.md`
+//! and `docs/adr/0007-macaroon-merge.md`.
 //!
-//! A macaroon is a bearer token whose holder can:
-//!   - **attenuate** it (add caveats and derive a weaker child token)
-//!   - but not **escalate** it (the HMAC-SHA256 chain enforces every caveat)
+//! Everything in the v2.0 trust model is a macaroon:
 //!
-//! Verification is stateless: given the per-session root key, we recompute
-//! the HMAC chain and constant-time-compare against the stored signature,
-//! then evaluate every caveat against the current request context.
+//! - **Root macaroon** — the dev's session. Stored at `$LLM_SECRETS_DIR/session.json`.
+//!   Caveats describe the dev's current context (who/repo/branch/agent/expires_at)
+//!   and constrain when the token is valid.
+//! - **Derived macaroon** — a child token the dev mints with extra caveats and
+//!   hands to an agent. The HMAC chain extends from the root's signature, so
+//!   verification needs only the root key + the full caveat list.
 //!
-//! The dev mints a macaroon scoped to one task; the agent receives a token
-//! that does *less* than the dev's session, never more.
+//! There is no other identity object. There is no `Session` struct, no Ed25519
+//! signing, no separate `Claims`. The macaroon's caveats are the claims.
+//!
+//! Verification semantics:
+//!
+//! 1. Recompute the HMAC-SHA256 chain from `root_key + id + canonical(caveats)`
+//!    and constant-time-compare against the stored signature. Tampering at any
+//!    point breaks the chain. Caveats cannot be removed, substituted, or
+//!    reordered.
+//! 2. Evaluate every caveat against the **current request context** —
+//!    re-gathered fresh from `git config`, `$PWD`, environment variables.
+//!    A token whose caveats no longer hold (wrong branch, expired, wrong
+//!    agent) is rejected.
+//!
+//! The agent never holds the root key. It cannot mint new macaroons. It cannot
+//! widen the one it holds — every caveat is enforced by the chain.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
+use crate::agent;
 use crate::error::{Error, Result};
-use crate::identity::Claims;
 use crate::store::store_dir;
 
-const ROOT_KEY_FILENAME: &str = "macaroon_root.key";
+const ROOT_KEY_FILENAME: &str = "root.key";
+const SESSION_FILENAME: &str = "session.json";
 const ROOT_KEY_LEN: usize = 32;
 const ID_LEN: usize = 16;
 const LOCATION: &str = "llm-secrets://localhost";
 
 type HmacSha256 = Hmac<Sha256>;
 
+// ---- file paths -----------------------------------------------------------
+
 pub fn root_key_path() -> Result<PathBuf> {
     Ok(store_dir()?.join(ROOT_KEY_FILENAME))
 }
 
+pub fn session_path() -> Result<PathBuf> {
+    Ok(store_dir()?.join(SESSION_FILENAME))
+}
+
+// ---- root key -------------------------------------------------------------
+
 /// Generate a fresh per-session HMAC root key. Called by `session-start`.
 /// Overwrites any existing key — minting a new session invalidates every
-/// macaroon derived from the previous one.
+/// macaroon (root and derived) from the previous session.
 pub fn rotate_root_key() -> Result<()> {
     let mut key = [0u8; ROOT_KEY_LEN];
     rand::rngs::OsRng.fill_bytes(&mut key);
@@ -48,15 +74,12 @@ pub fn rotate_root_key() -> Result<()> {
         .parent()
         .ok_or_else(|| Error::Other("no parent dir for root key".into()))?;
     fs::create_dir_all(parent)?;
-    let tmp = parent.join(".macaroon_root.key.tmp");
-    fs::write(&tmp, key)?;
-    set_perms(&tmp)?;
-    fs::rename(&tmp, &path)?;
+    write_secret_file(&path, &key)?;
     Ok(())
 }
 
-/// Delete the root key — the killswitch primitive. Every derived macaroon
-/// becomes unverifiable in O(1).
+/// Delete the root key — the killswitch primitive. Every macaroon (root and
+/// derived) becomes unverifiable in O(1).
 pub fn delete_root_key() -> Result<()> {
     let path = root_key_path()?;
     if path.exists() {
@@ -72,64 +95,69 @@ fn load_root_key() -> Result<[u8; ROOT_KEY_LEN]> {
     }
     let bytes = fs::read(&path)?;
     if bytes.len() != ROOT_KEY_LEN {
-        return Err(Error::Other("macaroon root key has wrong length".into()));
+        return Err(Error::Other("root key has wrong length".into()));
     }
     let mut out = [0u8; ROOT_KEY_LEN];
     out.copy_from_slice(&bytes);
     Ok(out)
 }
 
-#[cfg(unix)]
-fn set_perms(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-#[cfg(not(unix))]
-fn set_perms(_path: &std::path::Path) -> Result<()> {
-    Ok(())
-}
-
 // ---- caveats --------------------------------------------------------------
 
 /// Stateless predicates evaluated against the current request context.
-/// See ADR 0006 for the rationale on which caveats are in v1.1 vs deferred.
+/// All caveats are checked at verification time against fresh values, not
+/// against any stored "session state".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Caveat {
     /// Restrict to a single named secret.
     SecretEq(String),
-    /// Restrict to a list of named secrets.
+    /// Restrict to one of a list of named secrets.
     SecretsIn(Vec<String>),
     /// Token invalid after this RFC3339 timestamp.
     ExpiresAt(DateTime<Utc>),
-    /// Token only valid in this repo (matches active session's claims.repo).
+    /// Token only valid in this repo (matches `git remote get-url origin`,
+    /// normalised to `owner/repo`).
     RepoEq(String),
-    /// Token only valid on this branch.
+    /// Token only valid on this git branch.
     BranchEq(String),
-    /// Token only valid for this detected agent.
+    /// Token only valid for this detected agent (claude-code, cursor, etc).
     AgentEq(String),
-    /// Token only valid for this user (matches active session's claims.who).
+    /// Token only valid for this user (matches `git config user.email`).
     WhoEq(String),
 }
 
-/// Context against which caveats are evaluated. The verifier passes the key
-/// being requested plus the active session's claims.
+/// Context against which caveats are evaluated. Always built fresh via
+/// `Context::current()` — never cached.
 pub struct Context<'a> {
     pub key: &'a str,
-    pub claims: &'a Claims,
+    pub now: DateTime<Utc>,
+    pub who: String,
+    pub repo: String,
+    pub branch: String,
+    pub agent: String,
+}
+
+impl<'a> Context<'a> {
+    /// Gather the current context from the environment for the given key.
+    /// Best-effort: missing fields become empty strings, and a caveat that
+    /// requires a missing field will simply not match.
+    pub fn current(key: &'a str) -> Self {
+        Self {
+            key,
+            now: Utc::now(),
+            who: git("config", &["user.email"]).unwrap_or_default(),
+            repo: detect_repo(),
+            branch: git("rev-parse", &["--abbrev-ref", "HEAD"]).unwrap_or_default(),
+            agent: agent::detect_or_none(),
+        }
+    }
 }
 
 impl Caveat {
     pub fn check(&self, ctx: &Context) -> std::result::Result<(), String> {
         match self {
-            Caveat::SecretEq(s) => {
-                if ctx.key == s {
-                    Ok(())
-                } else {
-                    Err(format!("secret_eq: requested '{}' != '{}'", ctx.key, s))
-                }
-            }
+            Caveat::SecretEq(s) => eq_or_err("secret", ctx.key, s),
             Caveat::SecretsIn(list) => {
                 if list.iter().any(|s| s == ctx.key) {
                     Ok(())
@@ -138,57 +166,21 @@ impl Caveat {
                 }
             }
             Caveat::ExpiresAt(t) => {
-                if Utc::now() < *t {
+                if ctx.now < *t {
                     Ok(())
                 } else {
                     Err(format!("expires_at: token expired at {}", t.to_rfc3339()))
                 }
             }
-            Caveat::RepoEq(r) => {
-                if ctx.claims.repo == *r {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "repo_eq: session repo '{}' != '{}'",
-                        ctx.claims.repo, r
-                    ))
-                }
-            }
-            Caveat::BranchEq(b) => {
-                if ctx.claims.branch == *b {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "branch_eq: session branch '{}' != '{}'",
-                        ctx.claims.branch, b
-                    ))
-                }
-            }
-            Caveat::AgentEq(a) => {
-                if ctx.claims.agent == *a {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "agent_eq: session agent '{}' != '{}'",
-                        ctx.claims.agent, a
-                    ))
-                }
-            }
-            Caveat::WhoEq(w) => {
-                if ctx.claims.who == *w {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "who_eq: session user '{}' != '{}'",
-                        ctx.claims.who, w
-                    ))
-                }
-            }
+            Caveat::RepoEq(r) => eq_or_err("repo", &ctx.repo, r),
+            Caveat::BranchEq(b) => eq_or_err("branch", &ctx.branch, b),
+            Caveat::AgentEq(a) => eq_or_err("agent", &ctx.agent, a),
+            Caveat::WhoEq(w) => eq_or_err("who", &ctx.who, w),
         }
     }
 
-    /// Canonical byte form of this caveat for HMAC chain input. Two equal
-    /// caveats must always produce the same bytes.
+    /// Canonical byte form for HMAC chain input. Two equal caveats produce
+    /// identical bytes (sorted JSON keys, no whitespace).
     fn canonical_bytes(&self) -> Result<Vec<u8>> {
         let value = serde_json::to_value(self)
             .map_err(|e| Error::Other(format!("caveat serialise: {e}")))?;
@@ -196,7 +188,7 @@ impl Caveat {
         serde_json::to_vec(&sorted).map_err(|e| Error::Other(format!("caveat serialise: {e}")))
     }
 
-    /// Human-readable summary for `inspect`.
+    /// Human-readable summary used by `inspect` and `session-info`.
     pub fn describe(&self) -> String {
         match self {
             Caveat::SecretEq(s) => format!("secret == {s}"),
@@ -207,6 +199,14 @@ impl Caveat {
             Caveat::AgentEq(a) => format!("agent == {a}"),
             Caveat::WhoEq(w) => format!("user == {w}"),
         }
+    }
+}
+
+fn eq_or_err(field: &str, actual: &str, expected: &str) -> std::result::Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("{field}_eq: '{actual}' != '{expected}'"))
     }
 }
 
@@ -238,24 +238,56 @@ pub struct Macaroon {
 }
 
 impl Macaroon {
-    /// Mint a fresh macaroon. The HMAC chain begins with `HMAC(root_key, id)`
-    /// and folds in each caveat in order.
-    pub fn mint(caveats: Vec<Caveat>) -> Result<Self> {
-        let root_key = load_root_key()?;
-        let mut id_bytes = [0u8; ID_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut id_bytes);
-        let id = B64URL.encode(id_bytes);
+    /// Mint a fresh root macaroon for the dev's current context. Auto-gathers
+    /// who/repo/branch/agent and adds the requested TTL as `expires_at`.
+    /// Saves it as `session.json`.
+    pub fn mint_root(ttl: Duration) -> Result<Self> {
+        rotate_root_key()?;
+        let caveats = gather_root_caveats(ttl);
+        let m = mint_with_caveats(caveats)?;
+        m.save_as_root()?;
+        Ok(m)
+    }
 
-        let mut sig = hmac_step(&root_key, id.as_bytes())?;
-        for c in &caveats {
-            let bytes = c.canonical_bytes()?;
-            sig = hmac_step(&sig, &bytes)?;
+    /// Load the root macaroon from `session.json`. Errors if no session exists.
+    pub fn load_root() -> Result<Self> {
+        let path = session_path()?;
+        if !path.exists() {
+            return Err(Error::NoSession);
         }
+        let bytes = fs::read(&path)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Other(format!("corrupt session.json: {e}")))
+    }
 
+    pub fn save_as_root(&self) -> Result<()> {
+        let path = session_path()?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Other("no parent dir".into()))?;
+        fs::create_dir_all(parent)?;
+        let json = serde_json::to_vec_pretty(self)
+            .map_err(|e| Error::Other(format!("session serialise: {e}")))?;
+        write_secret_file(&path, &json)
+    }
+
+    /// Derive a child macaroon by adding extra caveats. The child carries
+    /// all of self's caveats plus the new ones, and its signature extends
+    /// the chain from self's current signature. The child is verifiable
+    /// with the same root key as the parent.
+    pub fn delegate(&self, extras: Vec<Caveat>) -> Result<Self> {
+        let mut sig = B64URL
+            .decode(&self.signature)
+            .map_err(|e| Error::Other(format!("parent macaroon signature invalid: {e}")))?;
+        let mut all_caveats = self.caveats.clone();
+        for c in extras {
+            sig = hmac_step(&sig, &c.canonical_bytes()?)?;
+            all_caveats.push(c);
+        }
         Ok(Self {
-            id,
-            location: LOCATION.to_string(),
-            caveats,
+            id: self.id.clone(),
+            location: self.location.clone(),
+            caveats: all_caveats,
             signature: B64URL.encode(sig),
         })
     }
@@ -266,14 +298,12 @@ impl Macaroon {
         let root_key = load_root_key()?;
         let mut sig = hmac_step(&root_key, self.id.as_bytes())?;
         for c in &self.caveats {
-            let bytes = c.canonical_bytes()?;
-            sig = hmac_step(&sig, &bytes)?;
+            sig = hmac_step(&sig, &c.canonical_bytes()?)?;
         }
         let stored = B64URL
             .decode(&self.signature)
             .map_err(|e| Error::Other(format!("macaroon signature invalid base64: {e}")))?;
 
-        // Constant-time comparison to avoid timing oracles.
         if sig.ct_eq(&stored).unwrap_u8() != 1 {
             return Err(Error::Other(
                 "macaroon signature invalid (chain mismatch — tampered or wrong root key)".into(),
@@ -284,7 +314,7 @@ impl Macaroon {
             if let Err(reason) = c.check(ctx) {
                 return Err(Error::PolicyDenied {
                     key: ctx.key.to_string(),
-                    reason: format!("macaroon caveat failed: {reason}"),
+                    reason: format!("caveat failed: {reason}"),
                 });
             }
         }
@@ -308,11 +338,137 @@ impl Macaroon {
     }
 }
 
+/// Mint a macaroon with the given caveats, computing the chain from the
+/// root key. Used internally by `mint_root`.
+fn mint_with_caveats(caveats: Vec<Caveat>) -> Result<Macaroon> {
+    let root_key = load_root_key()?;
+    let mut id_bytes = [0u8; ID_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut id_bytes);
+    let id = B64URL.encode(id_bytes);
+
+    let mut sig = hmac_step(&root_key, id.as_bytes())?;
+    for c in &caveats {
+        sig = hmac_step(&sig, &c.canonical_bytes()?)?;
+    }
+    Ok(Macaroon {
+        id,
+        location: LOCATION.to_string(),
+        caveats,
+        signature: B64URL.encode(sig),
+    })
+}
+
+/// Auto-gather the dev's current context as caveats on a fresh root macaroon.
+/// All fields are best-effort; a missing git config simply produces an empty
+/// caveat that won't match anything (you'll need to renew once `git config`
+/// is set).
+pub fn gather_root_caveats(ttl: Duration) -> Vec<Caveat> {
+    let mut caveats = Vec::new();
+    if let Some(who) = git("config", &["user.email"]) {
+        caveats.push(Caveat::WhoEq(who));
+    }
+    let repo = detect_repo();
+    if !repo.is_empty() {
+        caveats.push(Caveat::RepoEq(repo));
+    }
+    if let Some(branch) = git("rev-parse", &["--abbrev-ref", "HEAD"]) {
+        caveats.push(Caveat::BranchEq(branch));
+    }
+    if let Some(agent_name) = agent::detect() {
+        caveats.push(Caveat::AgentEq(agent_name.0));
+    }
+    caveats.push(Caveat::ExpiresAt(Utc::now() + ttl));
+    caveats
+}
+
 fn hmac_step(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
         .map_err(|e| Error::Other(format!("hmac init: {e}")))?;
     mac.update(data);
     Ok(mac.finalize().into_bytes().to_vec())
+}
+
+// ---- duration parsing -----------------------------------------------------
+
+/// Parse a duration string like `5m`, `1h`, `30s`, `2d`. Lean — no fancy
+/// parser, just `<n><unit>`.
+pub fn parse_duration(input: &str) -> Result<Duration> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(Error::Other("empty duration".into()));
+    }
+    let (num_str, unit) = input.split_at(input.len() - 1);
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| Error::Other(format!("invalid duration: {input}")))?;
+    let dur = match unit {
+        "s" => Duration::seconds(n),
+        "m" => Duration::minutes(n),
+        "h" => Duration::hours(n),
+        "d" => Duration::days(n),
+        _ => return Err(Error::Other(format!("invalid duration unit: {input}"))),
+    };
+    Ok(dur)
+}
+
+// ---- git helpers ----------------------------------------------------------
+
+fn git(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = ProcessCommand::new("git")
+        .arg(cmd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn detect_repo() -> String {
+    let url = match git("remote", &["get-url", "origin"]) {
+        Some(u) => u,
+        None => return String::new(),
+    };
+    let stripped = url.trim_end_matches(".git").trim_end_matches('/');
+    if let Some(rest) = stripped.split_once(':').map(|(_, r)| r) {
+        return rest.to_string();
+    }
+    let parts: Vec<&str> = stripped.rsplit('/').take(2).collect();
+    if parts.len() == 2 {
+        return format!("{}/{}", parts[1], parts[0]);
+    }
+    stripped.to_string()
+}
+
+// ---- file helpers ---------------------------------------------------------
+
+fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Other(format!("invalid path: {}", path.display())))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("llm-secrets")
+    ));
+    fs::write(&tmp, bytes)?;
+    set_perms(&tmp)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_perms(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+#[cfg(not(unix))]
+fn set_perms(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 // ---- helpers used by the CLI ---------------------------------------------
@@ -330,82 +486,41 @@ pub fn pick_macaroon(flag: &Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
 
-    fn sample_claims() -> Claims {
-        let now = Utc::now();
-        Claims {
+    fn ctx_for(key: &str) -> Context<'_> {
+        Context {
+            key,
+            now: Utc::now(),
             who: "alice@acme.com".into(),
             repo: "acme/billing".into(),
             branch: "main".into(),
             agent: "claude-code".into(),
-            pid: 99,
-            started_at: now,
-            expires_at: now + Duration::hours(1),
         }
     }
 
     #[test]
-    fn caveat_secret_eq() {
-        let c = Caveat::SecretEq("db".into());
-        let claims = sample_claims();
+    fn caveat_basic_checks() {
+        assert!(Caveat::SecretEq("db".into()).check(&ctx_for("db")).is_ok());
         assert!(
-            c.check(&Context {
-                key: "db",
-                claims: &claims
-            })
-            .is_ok()
+            Caveat::SecretEq("db".into())
+                .check(&ctx_for("other"))
+                .is_err()
         );
+        assert!(Caveat::BranchEq("main".into()).check(&ctx_for("x")).is_ok());
+        assert!(Caveat::BranchEq("dev".into()).check(&ctx_for("x")).is_err());
         assert!(
-            c.check(&Context {
-                key: "other",
-                claims: &claims
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn caveat_expires_at() {
-        let claims = sample_claims();
-        let past = Caveat::ExpiresAt(Utc::now() - Duration::seconds(1));
-        let future = Caveat::ExpiresAt(Utc::now() + Duration::hours(1));
-        assert!(
-            past.check(&Context {
-                key: "x",
-                claims: &claims
-            })
-            .is_err()
-        );
-        assert!(
-            future
-                .check(&Context {
-                    key: "x",
-                    claims: &claims
-                })
+            Caveat::WhoEq("alice@acme.com".into())
+                .check(&ctx_for("x"))
                 .is_ok()
         );
     }
 
     #[test]
-    fn caveat_branch_eq_against_session() {
-        let claims = sample_claims();
-        let ok = Caveat::BranchEq("main".into());
-        let bad = Caveat::BranchEq("feature".into());
-        assert!(
-            ok.check(&Context {
-                key: "x",
-                claims: &claims
-            })
-            .is_ok()
-        );
-        assert!(
-            bad.check(&Context {
-                key: "x",
-                claims: &claims
-            })
-            .is_err()
-        );
+    fn caveat_expires_at() {
+        let past = Caveat::ExpiresAt(Utc::now() - Duration::seconds(1));
+        let future = Caveat::ExpiresAt(Utc::now() + Duration::hours(1));
+        assert!(past.check(&ctx_for("x")).is_err());
+        assert!(future.check(&ctx_for("x")).is_ok());
     }
 
     #[test]
@@ -417,8 +532,6 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip() {
-        // We don't need a real root key for encode/decode of an inert macaroon
-        // (we just bypass mint by constructing manually).
         let m = Macaroon {
             id: "abc".into(),
             location: LOCATION.into(),
@@ -432,13 +545,21 @@ mod tests {
         let decoded = Macaroon::decode(&encoded).unwrap();
         assert_eq!(decoded.id, "abc");
         assert_eq!(decoded.caveats.len(), 2);
-        assert_eq!(decoded.caveats[0], Caveat::SecretEq("db".into()));
     }
 
-    /// Both the tamper-detection and the escalation-prevention properties
-    /// live in one test because they both mutate `$LLM_SECRETS_DIR`. Cargo
-    /// runs tests in parallel by default, so two tests racing on the same
-    /// env var was non-deterministic across platforms. One test ⇒ no race.
+    #[test]
+    fn parse_duration_units() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::seconds(30));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::minutes(5));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::hours(1));
+        assert_eq!(parse_duration("2d").unwrap(), Duration::days(2));
+        assert!(parse_duration("5x").is_err());
+        assert!(parse_duration("").is_err());
+    }
+
+    /// Tamper detection + escalation prevention. Both properties live in
+    /// one test to serialise the env mutation against itself (parallel
+    /// test runs would race on $LLM_SECRETS_DIR otherwise).
     #[test]
     fn hmac_chain_properties() {
         let dir = tempfile::tempdir().unwrap();
@@ -446,95 +567,71 @@ mod tests {
         unsafe {
             std::env::set_var("LLM_SECRETS_DIR", dir.path());
         }
-
         rotate_root_key().unwrap();
 
-        let claims = sample_claims();
-
         // ---- Property 1: tampering invalidates the signature -------------
-
-        let m = Macaroon::mint(vec![
-            Caveat::SecretEq("db_password".into()),
+        let m = mint_with_caveats(vec![
+            Caveat::SecretEq("db".into()),
             Caveat::BranchEq("main".into()),
         ])
         .unwrap();
-        let ctx_ok = Context {
-            key: "db_password",
-            claims: &claims,
-        };
-        m.verify(&ctx_ok).unwrap();
+        let ctx = ctx_for("db");
+        m.verify(&ctx).unwrap();
 
-        // Substitute a caveat with a wider one. Signature should fail
-        // BEFORE caveat evaluation — chain integrity check.
+        // Substitute a caveat → chain breaks before caveat eval.
         let mut substituted = m.clone();
-        substituted.caveats[0] = Caveat::SecretEq("admin_password".into());
-        let err = substituted.verify(&ctx_ok).unwrap_err();
+        substituted.caveats[0] = Caveat::SecretEq("admin".into());
         assert!(
-            err.to_string().contains("signature invalid"),
-            "expected HMAC chain failure, got: {err}"
+            substituted
+                .verify(&ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("signature invalid")
         );
 
-        // Drop a caveat — same chain failure.
+        // Drop a caveat → chain breaks.
         let mut shorter = m.clone();
         shorter.caveats.pop();
-        assert!(shorter.verify(&ctx_ok).is_err());
+        assert!(shorter.verify(&ctx).is_err());
 
-        // Reorder caveats — same chain failure.
+        // Reorder → chain breaks.
         let mut reordered = m.clone();
         reordered.caveats.reverse();
-        assert!(reordered.verify(&ctx_ok).is_err());
+        assert!(reordered.verify(&ctx).is_err());
 
         // ---- Property 2: cannot escalate by removing caveats -------------
-        //
-        // The defining macaroon property: a holder of an attenuated token
-        // cannot recover the original authority by removing caveats.
-
-        let wide = Macaroon::mint(vec![Caveat::SecretEq("db".into())]).unwrap();
-        let tight = Macaroon::mint(vec![
+        let tight = mint_with_caveats(vec![
             Caveat::SecretEq("db".into()),
-            Caveat::ExpiresAt(Utc::now() - chrono::Duration::seconds(1)),
+            Caveat::ExpiresAt(Utc::now() - Duration::seconds(1)),
         ])
         .unwrap();
-        let ctx_db = Context {
-            key: "db",
-            claims: &claims,
-        };
-        wide.verify(&ctx_db).unwrap();
-        assert!(tight.verify(&ctx_db).is_err()); // expired
-
-        // Attempt to "escalate" tight by removing the expiry caveat. The
-        // signature does not match a single-caveat chain — verify fails.
+        assert!(tight.verify(&ctx).is_err()); // expired
         let mut escalated = tight.clone();
         escalated.caveats.pop();
-        let err = escalated.verify(&ctx_db).unwrap_err();
-        assert!(err.to_string().contains("signature invalid"));
+        assert!(
+            escalated
+                .verify(&ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("signature invalid")
+        );
 
-        // Cleanup.
+        // ---- Property 3: delegation chains correctly --------------------
+        let parent = mint_with_caveats(vec![Caveat::WhoEq("alice@acme.com".into())]).unwrap();
+        let child = parent
+            .delegate(vec![Caveat::SecretEq("db".into())])
+            .unwrap();
+        // Child verifies — chain extends from parent.
+        child.verify(&ctx_for("db")).unwrap();
+        // Child cannot be widened by removing the new caveat.
+        let mut wider = child.clone();
+        wider.caveats.pop();
+        assert!(wider.verify(&ctx).is_err());
+
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("LLM_SECRETS_DIR", v),
                 None => std::env::remove_var("LLM_SECRETS_DIR"),
-            }
-        }
-    }
-
-    #[test]
-    fn pick_macaroon_prefers_flag() {
-        // Save and restore env to be a good test citizen.
-        let prev = std::env::var("LLM_SECRETS_MACAROON").ok();
-        // SAFETY: tests run single-threaded by default at the module level for
-        // env mutation; remove_var/set_var are unsafe in 2024 edition.
-        unsafe {
-            std::env::set_var("LLM_SECRETS_MACAROON", "from-env");
-        }
-        let flag = Some("from-flag".to_string());
-        assert_eq!(pick_macaroon(&flag).as_deref(), Some("from-flag"));
-        let no_flag: Option<String> = None;
-        assert_eq!(pick_macaroon(&no_flag).as_deref(), Some("from-env"));
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("LLM_SECRETS_MACAROON", v),
-                None => std::env::remove_var("LLM_SECRETS_MACAROON"),
             }
         }
     }

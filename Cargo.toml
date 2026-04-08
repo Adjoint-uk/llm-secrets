@@ -1,6 +1,6 @@
 [package]
 name = "llm-secrets"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2024"
 description = "Workload identity for AI agents — prove who you are, access only what you should, for only as long as you need"
 license = "MIT"
@@ -20,7 +20,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 secrecy = "0.10"
 zeroize = "1"

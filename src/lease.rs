@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::identity::{Claims, active_session};
+use crate::macaroon::Context;
 use crate::store::store_dir;
 
 const LEASES_FILENAME: &str = "leases.json";
@@ -101,25 +101,25 @@ impl LeaseSet {
     }
 }
 
-/// Grant a new lease, anchoring it to the active session and recording the
-/// fact in the audit log.
+/// Grant a new lease, anchoring it to the current request context and
+/// recording the fact in the audit log.
 pub fn grant(key: &str, ttl: chrono::Duration) -> Result<Lease> {
-    let session = active_session()?;
+    let ctx = Context::current(key);
     let now = Utc::now();
     let lease = Lease {
         key: key.to_string(),
         granted_at: now,
         expires_at: now + ttl,
-        session_who: session.claims.who.clone(),
-        session_repo: session.claims.repo.clone(),
-        session_agent: session.claims.agent.clone(),
-        session_pid: session.claims.pid,
+        session_who: ctx.who.clone(),
+        session_repo: ctx.repo.clone(),
+        session_agent: ctx.agent.clone(),
+        session_pid: std::process::id(),
     };
     let mut set = LeaseSet::load()?;
     set.prune();
     set.leases.push(lease.clone());
     set.save()?;
-    audit("lease.grant", key, &session.claims, None)?;
+    audit("lease.grant", &ctx, None)?;
     Ok(lease)
 }
 
@@ -142,7 +142,7 @@ pub struct AuditEntry {
 /// Append a single audit record. Best-effort: if the file cannot be opened
 /// for append we still return Err so callers can decide whether to fail
 /// the operation. (Default: yes — auditability is load-bearing.)
-pub fn audit(event: &str, key: &str, claims: &Claims, note: Option<String>) -> Result<()> {
+pub fn audit(event: &str, ctx: &Context, note: Option<String>) -> Result<()> {
     let path = audit_path()?;
     let parent = path
         .parent()
@@ -152,12 +152,12 @@ pub fn audit(event: &str, key: &str, claims: &Claims, note: Option<String>) -> R
     let entry = AuditEntry {
         at: Utc::now(),
         event: event.to_string(),
-        key: key.to_string(),
-        who: claims.who.clone(),
-        repo: claims.repo.clone(),
-        branch: claims.branch.clone(),
-        agent: claims.agent.clone(),
-        pid: claims.pid,
+        key: ctx.key.to_string(),
+        who: ctx.who.clone(),
+        repo: ctx.repo.clone(),
+        branch: ctx.branch.clone(),
+        agent: ctx.agent.clone(),
+        pid: std::process::id(),
         note,
     };
     let line =
@@ -190,35 +190,23 @@ pub fn read_recent(n: usize) -> Result<Vec<AuditEntry>> {
 
 // ---- killswitch -----------------------------------------------------------
 
-/// Emergency: revoke every active lease and the active session. Audited.
-/// Returns the number of leases revoked.
+/// Emergency killswitch. Clears every active lease, deletes the macaroon
+/// root key (invalidating every issued token in O(1)), and deletes the root
+/// macaroon (`session.json`). Audited.
 pub fn revoke_all() -> Result<usize> {
     let mut set = LeaseSet::load()?;
     let count = set.leases.len();
     set.leases.clear();
     set.save()?;
 
-    // Best-effort claims for the audit entry — fall back to empty if no
-    // session was active.
-    let claims = active_session()
-        .map(|s| s.claims)
-        .unwrap_or_else(|_| Claims {
-            who: String::new(),
-            repo: String::new(),
-            branch: String::new(),
-            agent: String::new(),
-            pid: std::process::id(),
-            started_at: Utc::now(),
-            expires_at: Utc::now(),
-        });
-    audit(
-        "revoke.all",
-        "*",
-        &claims,
-        Some(format!("revoked {count} leases")),
-    )?;
+    let ctx = Context::current("*");
+    audit("revoke.all", &ctx, Some(format!("revoked {count} leases")))?;
 
-    crate::identity::delete_session()?;
+    crate::macaroon::delete_root_key()?;
+    let session_path = crate::macaroon::session_path()?;
+    if session_path.exists() {
+        fs::remove_file(session_path)?;
+    }
     Ok(count)
 }
 

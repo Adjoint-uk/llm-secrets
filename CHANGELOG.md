@@ -4,6 +4,51 @@ All notable changes to `llm-secrets` will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] — 2026-04-08
+
+**One primitive: the session is a macaroon.** v2.0 collapses the two parallel identity concepts (Ed25519-signed sessions and HMAC-chained macaroons) into a single object. The dev's session is the **root macaroon**. A delegated agent token is a **child macaroon derived from that root**. There is no other identity object in the system.
+
+This is a breaking change. v1.0/v1.1 session files do not parse. Adoption was essentially zero (we shipped v1.0 less than 24 hours ago) so the cost is small.
+
+### The unified model
+
+- `session.json` now contains a `Macaroon` (the dev's root). Its caveats describe the dev's current context: `WhoEq`, `RepoEq`, `BranchEq`, `AgentEq`, `ExpiresAt`. Same enum, same on-disk format as a delegated child token.
+- `macaroon_root.key` → `root.key` (the HMAC root key for the only "root" in the system).
+- A delegated token is `root.delegate(extras)` — the HMAC chain extends from the root's signature, the child carries all the root's caveats *plus* the new ones, and verification needs only the same root key.
+- Every command that reads a secret value (`peek`, `exec --inject`, `lease`) goes through one gate that requires either the dev's root macaroon (loaded automatically from `session.json`) or an explicit `--macaroon` / `LLM_SECRETS_MACAROON`. **There is no ungated read path.**
+- Caveats are evaluated against a fresh `Context` built from the environment on every operation. There is no stored claim set to drift from reality.
+
+### Breaking changes
+
+- `session.json` format changed (now a `Macaroon` JSON, not an Ed25519-signed claim envelope). v1.x users must `llms session-start` once after upgrading.
+- `macaroon_root.key` renamed to `root.key`.
+- `peek`, `exec --inject`, and `lease` now **require** an active session (or a presented macaroon) — the v1.0 "permissive when no policy file" path is gone.
+- Audit event types: `peek` / `peek.macaroon` are now `peek` / `peek.delegated`. `exec.inject.macaroon` is now `exec.inject.delegated`. The suffix tells you whether the read used the dev's root or a delegated child.
+- The `require_macaroon` config flag from v1.2 (never released) is gone — strict mode is now the only mode.
+
+### Removed
+
+- `src/identity.rs` (~320 LOC) — the entire `Session`/`Claims`/Ed25519-signing module. Folded into `macaroon.rs`.
+- `src/config.rs` (~110 LOC) — the strict-mode flag. Strict is now the default and only mode.
+- `ed25519-dalek` dependency, plus the transitive `curve25519-dalek` and `x25519-dalek` from the signing path. The only signature primitive in the system is HMAC-SHA256.
+- Net: **~280 LOC removed** from the trust layer.
+
+### Added
+
+- ADR 0007 documents the merge: rationale, deletions, semantics, migration.
+- Five new properties tested by the unified `hmac_chain_properties` test: tamper detection across substituted/dropped/reordered caveats, escalation prevention by removing caveats, and **delegation chain extension** (a child verifies through the same root key as its parent).
+- `Context::current()` — gathers fresh claims from `git config`, `$PWD`, env vars on every read. One value type for both policy and macaroon evaluation.
+
+### Migration
+
+```bash
+# After cargo install llm-secrets --version 2.0:
+llms session-start --ttl 1h
+# Your store, secrets, and audit log are unchanged. session.json was
+# rewritten in the new format, root.key replaces macaroon_root.key, any
+# v1.1 macaroons are gone (they would have been ephemeral anyway).
+```
+
 ## [1.1.0] — 2026-04-08
 
 The dev no longer grants the agent the session's full identity. They **delegate** a slice of it as an attenuated capability.
@@ -71,6 +116,7 @@ The Rust rewrite is complete and the workload identity model is fully wired.
 
 - Final Python release. SOPS wrapper. Superseded by the Rust rewrite.
 
+[2.0.0]: https://github.com/adjoint-uk/llm-secrets/releases/tag/v2.0.0
 [1.1.0]: https://github.com/adjoint-uk/llm-secrets/releases/tag/v1.1.0
 [1.0.0]: https://github.com/adjoint-uk/llm-secrets/releases/tag/v1.0.0
 [0.2.0]: https://github.com/adjoint-uk/llm-secrets/releases/tag/v0.2.0

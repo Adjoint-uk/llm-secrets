@@ -195,16 +195,20 @@ fn call_tool(name: &str, args: &Value) -> Result<Value> {
                 .ok_or_else(|| crate::error::Error::Other("missing 'key'".into()))?;
             let chars = args.get("chars").and_then(Value::as_u64).unwrap_or(4) as usize;
 
-            crate::policy::check_access(key)?;
+            // v2.0: every read requires a verified macaroon (the dev's root,
+            // since the MCP server runs in the dev's process and inherits
+            // their identity). Policy is layered on top.
+            let root = crate::macaroon::Macaroon::load_root()?;
+            let ctx = crate::macaroon::Context::current(key);
+            root.verify(&ctx)?;
+            crate::policy::check_access(&ctx)?;
+
             let identity = store::load_identity()?;
             let st = store::load_store(&identity)?;
             let value = st
                 .get(key)
                 .ok_or_else(|| crate::error::Error::KeyNotFound(key.to_string()))?;
-            // Best-effort audit if a session is active.
-            if let Ok(session) = crate::identity::active_session() {
-                let _ = lease::audit("mcp.peek", key, &session.claims, None);
-            }
+            let _ = lease::audit("mcp.peek", &ctx, None);
             Ok(text_result(store::mask(value, chars)))
         }
 

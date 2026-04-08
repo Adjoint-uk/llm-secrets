@@ -3,36 +3,54 @@
 [![CI](https://github.com/adjoint-uk/llm-secrets/actions/workflows/ci.yml/badge.svg)](https://github.com/adjoint-uk/llm-secrets/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Workload identity for AI agents — prove who you are, access only what you should, for only as long as you need.
+**The first secrets manager built around capability delegation for AI coding agents.**
+
+You don't *give* your AI agent your credentials. You *delegate* a slice of your identity to it — narrowed to one secret, one repo, one branch, five minutes — using an attenuated, signed bearer token. The agent can use what you've given it. It cannot widen the grant. It cannot escalate.
 
 ## The Problem
 
-AI coding agents (Claude Code, Cursor, Copilot) run with your full identity. They can read `.env` files, environment variables, and anything in your filesystem. There's no boundary between what the agent needs and what it can see.
+AI coding agents (Claude Code, Cursor, Copilot, Aider) run with your full identity. They can read your `.env` files, your shell history, your `~/.aws/credentials`, anything on your filesystem. The secrets managers you already use weren't built for this — they all have a `get` command that prints plaintext to stdout, which in an LLM context is a leak that gets persisted to transcripts, training data, and provider logs. Telling the agent *"please don't"* is a request, not security.
 
-Existing tools either:
-- **Output raw secrets** that get captured in LLM context (`.env`, `sops`, `doppler run`)
-- **Use proxy daemons** that add operational complexity (agentsecrets, agent-secrets)
-- **Rely on honour systems** — telling the agent "don't look" isn't security
+The existing answers in this niche all miss the point:
 
-## The Approach
+- **`.env` files, `sops`, `doppler run`** — output raw secrets to stdout. Game over the moment an agent reads them.
+- **Proxy daemons (`agentsecrets`, `agent-secrets`)** — sit between the agent and the secret store and try to filter. Behavioural patches on a structural problem.
+- **Honour systems** — *"agent, please don't look at the .env"*. Not security.
 
-`llm-secrets` applies the **workload identity** pattern — the same model used by AWS IAM Roles Anywhere, SPIFFE, and HashiCorp Vault WIF — to AI coding agents.
+## The Approach — capability delegation
 
-The agent doesn't manage secrets. It **proves what it is**, and a policy engine decides what it can access:
+`llm-secrets` borrows from a pattern that took cloud computing from "VM with a password" to "workload identity with IAM": **the requester carries no secret material, only a narrowed grant of authority.**
 
+The dev mints a **macaroon** — a signed bearer token — scoped to exactly what the agent needs to do this one task:
+
+```bash
+# Mint: scoped to one secret, 5 minutes, only on this branch, only for Claude Code
+M=$(llms macaroon mint \
+    --secret db_password \
+    --ttl 5m \
+    --branch main \
+    --agent claude-code)
+
+# Hand it to the agent — it inherits a slice of your identity, not all of it
+LLM_SECRETS_MACAROON=$M claude
 ```
-Agent starts session → attestation signed:
-  who:   cptfinch (from git config)
-  where: adjoint-uk/billing, branch main
-  what:  Claude Code, pid 12345
-  when:  2026-03-22T11:00:00Z
 
-Agent requests secret → policy evaluated:
-  db_password → allowed (repo match, user match, TTL 5m)
-  stripe_key  → denied  (wrong repo)
-```
+The agent now holds a token that is *cryptographically* incapable of being widened. Every caveat (`secret`, `branch`, `agent`, `expires_at`, …) is enforced by an HMAC-SHA256 chain. Removing or substituting a caveat invalidates the signature. The agent can do *less* than you can, never more — and revocation is one command (`llms revoke-all` deletes the per-session HMAC root key, invalidating every derived macaroon in O(1)).
 
-**There is no `get` command.** This is architectural enforcement, not a convention.
+This is the same pattern Tailscale and Fly.io use for service auth — applied, for the first time, to AI coding agents.
+
+## What this is built on
+
+Underneath the macaroon layer, `llm-secrets` is also a properly-built workload-identity tool:
+
+- **Encrypted store** at rest using `age` (X25519 + ChaCha20-Poly1305).
+- **Signed sessions** — every operation is anchored to a tamper-evident, time-bounded claim of *who/where/what/when*, with the agent type auto-detected from the environment (Claude Code, Cursor, Copilot, Aider, Continue, Windsurf).
+- **Allow-list policy file** — drop a `.llm-secrets-policy.yaml` at the repo root; unmentioned keys are denied; deny rules short-circuit allows.
+- **Append-only audit log** — every secret access recorded with the full claim set.
+- **MCP server mode** — `llms mcp` exposes a *strict subset* of the CLI to MCP-compatible AI agents. **There is no MCP tool that returns plaintext.** The model literally cannot ask for one.
+- **No `get` command.** Plaintext leaves the binary only via `exec --inject` (into a child process's environment) or `peek` (deliberately lossy mask). This is *architectural enforcement* — verifiable in 50 lines of source — not a convention.
+
+The macaroon layer is the cutting edge. Everything else is the foundation that makes the cutting edge mean something.
 
 ## Installation
 
@@ -50,26 +68,39 @@ cargo build --release
 
 ## Quick Start
 
+### Set up the store (one-time)
+
 ```bash
-# Initialise (generates age keypair)
-llms init
-
-# Store a secret (hidden input)
-llms set db_password
-
-# List keys (no values)
-llms list
-
-# Masked preview
-llms peek db_password
-# → db_pa****word
-
-# Run a command with secrets injected
-llms exec --inject DB_PASS=db_password -- psql -U admin mydb
-
-# Check status
-llms status
+llms init                                    # generates an age identity, creates the encrypted store
+echo "$DB_PASSWORD" | llms set db_password --stdin
 ```
+
+### Direct CLI use (you, in your own terminal)
+
+```bash
+llms exec --inject DB_PASS=db_password -- psql -U admin mydb
+```
+
+### Agent use — the recommended pattern (you handing work to an AI agent)
+
+```bash
+# Start a session (signed claim of who/where/what/when)
+llms session-start --ttl 1h
+
+# Mint a macaroon scoped to exactly this task
+M=$(llms macaroon mint \
+    --secret db_password \
+    --ttl 5m \
+    --branch main \
+    --agent claude-code)
+
+# Hand it to the agent. The agent inherits the capability — not your full identity.
+LLM_SECRETS_MACAROON=$M claude
+```
+
+The agent can use `db_password` via `llms exec` for the next 5 minutes, only on this branch, only as `claude-code`. It cannot read any other secret. It cannot extend the TTL. It cannot remove the caveats. Every access is recorded in the audit log.
+
+When you're done — or if anything looks wrong — `llms revoke-all` deletes the macaroon root key and invalidates every derived token in O(1).
 
 ## Commands
 
@@ -152,7 +183,7 @@ Without a policy file, all secrets are accessible (backwards compatible).
 
 ## Status
 
-**v1.1 — released.** The Rust binary implements the full workload identity model: encrypted store, session attestation, policy engine, leases, audit log, killswitch, MCP server mode, and **macaroon-based capability delegation** for narrowing what an agent can do on the dev's behalf. See the [CHANGELOG](CHANGELOG.md) for the milestone breakdown and [`docs/adr/0006-macaroons.md`](docs/adr/0006-macaroons.md) for the v1.1 design.
+**v2.0 — released.** The session and the delegated token are **the same primitive** — both are macaroons. There is no other identity object in the system. Reads always travel through a verified token (the dev's root, loaded automatically, or an explicit child handed to an agent). Killswitch is one command. See [ADR 0007](docs/adr/0007-macaroon-merge.md) for the v2.0 design and [CHANGELOG](CHANGELOG.md) for the migration note.
 
 ## Contributing
 

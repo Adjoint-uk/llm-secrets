@@ -35,7 +35,7 @@ use std::process::Command as ProcessCommand;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::identity::Claims;
+use crate::macaroon::Context;
 
 const POLICY_FILENAME: &str = ".llm-secrets-policy.yaml";
 
@@ -87,14 +87,14 @@ impl StringOrList {
 }
 
 impl Rule {
-    pub fn matches(&self, claims: &Claims) -> bool {
+    pub fn matches(&self, ctx: &Context) -> bool {
         let check = |field: &Option<StringOrList>, value: &str| -> bool {
             field.as_ref().map(|f| f.matches(value)).unwrap_or(true)
         };
-        check(&self.repo, &claims.repo)
-            && check(&self.branch, &claims.branch)
-            && check(&self.user, &claims.who)
-            && check(&self.agent, &claims.agent)
+        check(&self.repo, &ctx.repo)
+            && check(&self.branch, &ctx.branch)
+            && check(&self.user, &ctx.who)
+            && check(&self.agent, &ctx.agent)
     }
 }
 
@@ -106,29 +106,29 @@ pub enum Decision {
 }
 
 impl Policy {
-    /// Evaluate the policy for a given key + claims. If the key is not
+    /// Evaluate the policy for a given context. If the requested key is not
     /// mentioned in the policy, it is denied: explicit allow-list semantics
     /// are safer than implicit allow.
-    pub fn evaluate(&self, key: &str, claims: &Claims) -> Decision {
-        let entry = match self.secrets.get(key) {
+    pub fn evaluate(&self, ctx: &Context) -> Decision {
+        let entry = match self.secrets.get(ctx.key) {
             Some(e) => e,
             None => {
-                return Decision::Deny(format!("no rule for '{key}' in policy"));
+                return Decision::Deny(format!("no rule for '{}' in policy", ctx.key));
             }
         };
 
         // Deny rules are checked first and short-circuit.
         for rule in &entry.deny {
-            if rule.matches(claims) {
-                return Decision::Deny(format!("denied by deny rule for '{key}'"));
+            if rule.matches(ctx) {
+                return Decision::Deny(format!("denied by deny rule for '{}'", ctx.key));
             }
         }
         for rule in &entry.allow {
-            if rule.matches(claims) {
+            if rule.matches(ctx) {
                 return Decision::Allow;
             }
         }
-        Decision::Deny(format!("no allow rule matched for '{key}'"))
+        Decision::Deny(format!("no allow rule matched for '{}'", ctx.key))
     }
 }
 
@@ -168,23 +168,18 @@ fn find_git_root() -> Option<PathBuf> {
 
 /// Top-level guard used by every command that reads secret values.
 ///
-/// - If there is no policy file, returns `Ok(())` (permissive default).
-/// - If there is a policy, requires an active session and evaluates.
-pub fn check_access(key: &str) -> Result<()> {
+/// - If there is no policy file, returns `Ok(())` — the macaroon caveats
+///   are the only gate.
+/// - If there is a policy file, evaluate the request context against it.
+pub fn check_access(ctx: &Context) -> Result<()> {
     let policy = match load_for_cwd()? {
         Some(p) => p,
         None => return Ok(()),
     };
-
-    let session = crate::identity::active_session().map_err(|_| Error::PolicyDenied {
-        key: key.to_string(),
-        reason: "policy file present but no active session — run `llms session-start`".into(),
-    })?;
-
-    match policy.evaluate(key, &session.claims) {
+    match policy.evaluate(ctx) {
         Decision::Allow => Ok(()),
         Decision::Deny(reason) => Err(Error::PolicyDenied {
-            key: key.to_string(),
+            key: ctx.key.to_string(),
             reason,
         }),
     }
@@ -193,18 +188,22 @@ pub fn check_access(key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Utc};
+    use chrono::Utc;
 
-    fn claims(repo: &str, branch: &str, user: &str, agent: &str) -> Claims {
-        let now = Utc::now();
-        Claims {
+    fn ctx(
+        key: &'static str,
+        repo: &str,
+        branch: &str,
+        user: &str,
+        agent: &str,
+    ) -> Context<'static> {
+        Context {
+            key,
+            now: Utc::now(),
             who: user.into(),
             repo: repo.into(),
             branch: branch.into(),
             agent: agent.into(),
-            pid: 1,
-            started_at: now,
-            expires_at: now + Duration::hours(1),
         }
     }
 
@@ -215,8 +214,8 @@ mod tests {
     #[test]
     fn unmentioned_key_is_denied() {
         let p = parse("secrets: {}");
-        let c = claims("a/b", "main", "u", "claude-code");
-        matches!(p.evaluate("anything", &c), Decision::Deny(_));
+        let c = ctx("anything", "a/b", "main", "u", "claude-code");
+        matches!(p.evaluate(&c), Decision::Deny(_));
     }
 
     #[test]
@@ -231,10 +230,22 @@ secrets:
         user: alice
 "#,
         );
-        let ok = claims("acme/billing", "main", "alice", "claude-code");
-        assert_eq!(p.evaluate("db_password", &ok), Decision::Allow);
-        let wrong_branch = claims("acme/billing", "feature", "alice", "claude-code");
-        matches!(p.evaluate("db_password", &wrong_branch), Decision::Deny(_));
+        let ok = ctx(
+            "db_password",
+            "acme/billing",
+            "main",
+            "alice",
+            "claude-code",
+        );
+        assert_eq!(p.evaluate(&ok), Decision::Allow);
+        let wrong_branch = ctx(
+            "db_password",
+            "acme/billing",
+            "feature",
+            "alice",
+            "claude-code",
+        );
+        matches!(p.evaluate(&wrong_branch), Decision::Deny(_));
     }
 
     #[test]
@@ -247,12 +258,12 @@ secrets:
       - branch: [main, develop]
 "#,
         );
-        let main = claims("a/b", "main", "u", "claude-code");
-        let dev = claims("a/b", "develop", "u", "claude-code");
-        let other = claims("a/b", "feature", "u", "claude-code");
-        assert_eq!(p.evaluate("db_password", &main), Decision::Allow);
-        assert_eq!(p.evaluate("db_password", &dev), Decision::Allow);
-        matches!(p.evaluate("db_password", &other), Decision::Deny(_));
+        let main = ctx("db_password", "a/b", "main", "u", "claude-code");
+        let dev = ctx("db_password", "a/b", "develop", "u", "claude-code");
+        let other = ctx("db_password", "a/b", "feature", "u", "claude-code");
+        assert_eq!(p.evaluate(&main), Decision::Allow);
+        assert_eq!(p.evaluate(&dev), Decision::Allow);
+        matches!(p.evaluate(&other), Decision::Deny(_));
     }
 
     #[test]
@@ -267,10 +278,10 @@ secrets:
       - branch: forbidden
 "#,
         );
-        let ok = claims("a/b", "main", "u", "claude-code");
-        let bad = claims("a/b", "forbidden", "u", "claude-code");
-        assert_eq!(p.evaluate("db_password", &ok), Decision::Allow);
-        matches!(p.evaluate("db_password", &bad), Decision::Deny(_));
+        let ok = ctx("db_password", "a/b", "main", "u", "claude-code");
+        let bad = ctx("db_password", "a/b", "forbidden", "u", "claude-code");
+        assert_eq!(p.evaluate(&ok), Decision::Allow);
+        matches!(p.evaluate(&bad), Decision::Deny(_));
     }
 
     #[test]
@@ -283,7 +294,7 @@ secrets:
       - branch: "*"
 "#,
         );
-        let c = claims("a/b", "anything", "u", "claude-code");
-        assert_eq!(p.evaluate("api_key", &c), Decision::Allow);
+        let c = ctx("api_key", "a/b", "anything", "u", "claude-code");
+        assert_eq!(p.evaluate(&c), Decision::Allow);
     }
 }
