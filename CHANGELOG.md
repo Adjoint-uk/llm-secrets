@@ -4,6 +4,33 @@ All notable changes to `llm-secrets` will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-04-08
+
+The dev no longer grants the agent the session's full identity. They **delegate** a slice of it as an attenuated capability.
+
+### Added
+
+- **Macaroon-based capability delegation.** A new `llms macaroon` subcommand mints, inspects, and verifies bearer tokens that scope what their holder can do (`--secret`, `--ttl`, `--repo`, `--branch`, `--agent`, `--who`). The dev mints; the agent inherits the token via `--macaroon` or `LLM_SECRETS_MACAROON`. The token holder cannot escalate — every caveat is enforced by an HMAC-SHA256 chain.
+- `peek`, `exec`, and `lease` grow a `--macaroon` flag (also honoured: `LLM_SECRETS_MACAROON` env var). When a macaroon is presented, it must verify *in addition to* the existing policy check — never instead of it.
+- Macaroon usage is audited: `peek.macaroon` and `exec.inject.macaroon` events appear in the audit log alongside the existing event types.
+- **`revoke-all` is now the macaroon killswitch too.** Deleting the per-session HMAC root key invalidates every derived macaroon in O(1).
+- ADR 0006 documents the capability-delegation design, the wire format, the cryptographic construction, and what is *not* in v1.1 (stateful caveats, third-party caveats, agent-side attenuation — all deferred).
+- 8 new tests (5 unit + 3 CLI integration), including HMAC chain tamper detection and the **escalation-prevention property** (the defining macaroon guarantee, regression-tested). Total: 44 tests.
+
+### Changed
+
+- `session-start` now generates a fresh per-session macaroon HMAC root key. Old sessions' macaroons no longer verify against the new session — restarting the session is itself a soft revocation.
+- `revoke-all`'s output line now mentions the macaroon root key alongside leases and the session.
+
+### Dependencies
+
+- Added: `hmac = "0.12"`, `sha2 = "0.10"`, `subtle = "2"` — all from [RustCrypto](https://github.com/RustCrypto), all minimal, all justified for the HMAC-SHA256 chain construction. Constant-time signature comparison via `subtle::ConstantTimeEq` to avoid timing oracles.
+
+### Notes for users
+
+- v1.0 flows are completely unchanged. Macaroons are opt-in; without `--macaroon` or the env var, every command behaves exactly as before.
+- The macaroon wire format is **experimental in v1.1**. We may break it in v1.2 if real-world usage exposes a problem. Treat tokens as ephemeral, not durable.
+
 ## [1.0.0] — 2026-04-07
 
 The Rust rewrite is complete and the workload identity model is fully wired.
@@ -44,6 +71,7 @@ The Rust rewrite is complete and the workload identity model is fully wired.
 
 - Final Python release. SOPS wrapper. Superseded by the Rust rewrite.
 
+[1.1.0]: https://github.com/adjoint-uk/llm-secrets/releases/tag/v1.1.0
 [1.0.0]: https://github.com/adjoint-uk/llm-secrets/releases/tag/v1.0.0
 [0.2.0]: https://github.com/adjoint-uk/llm-secrets/releases/tag/v0.2.0
 [0.1.1]: https://github.com/adjoint-uk/llm-secrets/releases/tag/v0.1.1

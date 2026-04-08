@@ -980,7 +980,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "llm-secrets"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "age",
  "assert_cmd",
@@ -991,12 +991,15 @@ dependencies = [
  "dialoguer",
  "dirs",
  "ed25519-dalek",
+ "hmac",
  "predicates",
  "rand",
  "secrecy",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "zeroize",

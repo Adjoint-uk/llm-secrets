@@ -116,6 +116,38 @@ llms audit --json
 
 The audit log is at `$LLM_SECRETS_DIR/audit.jsonl`, append-only, mode 0600.
 
+## Macaroons — delegating capability to an agent (v1.1+)
+
+A **macaroon** is a bearer token the dev mints to grant an agent narrow, time-bounded access to specific secrets. The agent inherits *less* than the dev's session, never more — it cannot escalate by removing caveats. See [ADR 0006](adr/0006-macaroons.md) for the full design.
+
+```bash
+# Mint: scoped to one secret, 5 minutes, only for Claude Code on this branch
+M=$(llms macaroon mint \
+    --secret db_password \
+    --ttl 5m \
+    --agent claude-code \
+    --branch main)
+
+# Inspect — pure parse, never touches the store
+echo "$M" | llms macaroon inspect
+
+# Verify against the current session context
+llms macaroon verify --macaroon "$M" --key db_password
+
+# Hand to an agent via env var, then run it
+export LLM_SECRETS_MACAROON="$M"
+claude
+
+# Or use it explicitly with one-shot exec
+llms exec --inject DB=db_password --macaroon "$M" -- ./run-migrations.sh
+```
+
+The agent never sees the macaroon root key. It cannot mint new macaroons. It cannot widen the one it holds. Every use is audited (`peek.macaroon` / `exec.inject.macaroon`).
+
+`revoke-all` deletes the root key, invalidating every derived macaroon in one shot.
+
+> **v1.1 status:** the wire format is *experimental* — treat tokens as ephemeral. We may break the format in v1.2 if real-world usage exposes a problem.
+
 ## Killswitch
 
 ```bash

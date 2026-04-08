@@ -152,7 +152,7 @@ Without a policy file, all secrets are accessible (backwards compatible).
 
 ## Status
 
-**v1.0 — released.** The Rust binary implements the full workload identity model: encrypted store, session attestation, policy engine, leases, audit log, killswitch, and MCP server mode. See the [CHANGELOG](CHANGELOG.md) for the milestone breakdown.
+**v1.1 — released.** The Rust binary implements the full workload identity model: encrypted store, session attestation, policy engine, leases, audit log, killswitch, MCP server mode, and **macaroon-based capability delegation** for narrowing what an agent can do on the dev's behalf. See the [CHANGELOG](CHANGELOG.md) for the milestone breakdown and [`docs/adr/0006-macaroons.md`](docs/adr/0006-macaroons.md) for the v1.1 design.
 
 ## Contributing
 

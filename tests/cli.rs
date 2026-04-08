@@ -318,6 +318,178 @@ fn mcp_initialize_lists_tools_and_never_returns_plaintext() {
 }
 
 #[test]
+fn macaroon_happy_path_and_denial() {
+    let dir = fresh_store();
+    let env_dir = dir.path();
+
+    // Seed a secret + start a session.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["set", "api_key", "--stdin"])
+        .write_stdin("super-secret-12345")
+        .assert()
+        .success();
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["session-start", "--ttl", "1h"])
+        .assert()
+        .success();
+
+    // Mint a macaroon scoped to api_key.
+    let mint = llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["macaroon", "mint", "--secret", "api_key", "--ttl", "5m"])
+        .assert()
+        .success();
+    let macaroon = String::from_utf8(mint.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(!macaroon.is_empty(), "macaroon mint produced no output");
+
+    // Inspect — pure parse, must not touch the store.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["macaroon", "inspect", "--macaroon", &macaroon])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("secret == api_key"));
+
+    // Verify against the matching key.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args([
+            "macaroon",
+            "verify",
+            "--macaroon",
+            &macaroon,
+            "--key",
+            "api_key",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+
+    // Happy path: peek with the macaroon — masked, not plaintext.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["peek", "api_key", "--macaroon", &macaroon])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("super-secret-12345").not())
+        .stdout(predicate::str::contains("*"));
+
+    // Happy path: exec via env var (the realistic agent flow).
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .env("LLM_SECRETS_MACAROON", &macaroon)
+        .args([
+            "exec",
+            "--inject",
+            "K=api_key",
+            "--",
+            "sh",
+            "-c",
+            "printf %s \"$K\"",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::diff("super-secret-12345"));
+}
+
+#[test]
+fn macaroon_scoped_to_other_secret_is_denied() {
+    let dir = fresh_store();
+    let env_dir = dir.path();
+
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["set", "db_password", "--stdin"])
+        .write_stdin("hunter2")
+        .assert()
+        .success();
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["set", "api_key", "--stdin"])
+        .write_stdin("not-this-one")
+        .assert()
+        .success();
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["session-start", "--ttl", "1h"])
+        .assert()
+        .success();
+
+    // Mint a macaroon scoped to api_key only.
+    let mint = llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["macaroon", "mint", "--secret", "api_key", "--ttl", "5m"])
+        .assert()
+        .success();
+    let macaroon = String::from_utf8(mint.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Trying to use it for db_password must be denied.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["peek", "db_password", "--macaroon", &macaroon])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("secret_eq"));
+}
+
+#[test]
+fn revoke_all_invalidates_existing_macaroon() {
+    let dir = fresh_store();
+    let env_dir = dir.path();
+
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["set", "api_key", "--stdin"])
+        .write_stdin("v")
+        .assert()
+        .success();
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["session-start", "--ttl", "1h"])
+        .assert()
+        .success();
+
+    let mint = llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["macaroon", "mint", "--secret", "api_key", "--ttl", "5m"])
+        .assert()
+        .success();
+    let macaroon = String::from_utf8(mint.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Works before revoke.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["peek", "api_key", "--macaroon", &macaroon])
+        .assert()
+        .success();
+
+    // Killswitch.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .arg("revoke-all")
+        .assert()
+        .success();
+
+    // Same macaroon must now fail (root key gone).
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["peek", "api_key", "--macaroon", &macaroon])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn audit_with_no_entries_is_clean() {
     let dir = fresh_store();
     llms()
