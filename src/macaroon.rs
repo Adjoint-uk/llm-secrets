@@ -435,9 +435,12 @@ mod tests {
         assert_eq!(decoded.caveats[0], Caveat::SecretEq("db".into()));
     }
 
+    /// Both the tamper-detection and the escalation-prevention properties
+    /// live in one test because they both mutate `$LLM_SECRETS_DIR`. Cargo
+    /// runs tests in parallel by default, so two tests racing on the same
+    /// env var was non-deterministic across platforms. One test ⇒ no race.
     #[test]
-    fn tampering_a_caveat_invalidates_signature() {
-        // Use a tempdir as $LLM_SECRETS_DIR so we don't pollute the real store.
+    fn hmac_chain_properties() {
         let dir = tempfile::tempdir().unwrap();
         let prev = std::env::var("LLM_SECRETS_DIR").ok();
         unsafe {
@@ -445,92 +448,68 @@ mod tests {
         }
 
         rotate_root_key().unwrap();
+
+        let claims = sample_claims();
+
+        // ---- Property 1: tampering invalidates the signature -------------
 
         let m = Macaroon::mint(vec![
             Caveat::SecretEq("db_password".into()),
             Caveat::BranchEq("main".into()),
         ])
         .unwrap();
-
-        let claims = sample_claims();
         let ctx_ok = Context {
             key: "db_password",
             claims: &claims,
         };
-
-        // Pristine: verifies.
         m.verify(&ctx_ok).unwrap();
 
-        // Tamper: replace SecretEq with a wider one. Signature should fail
-        // BEFORE caveat evaluation — this is the chain integrity check.
-        let mut tampered = m.clone();
-        tampered.caveats[0] = Caveat::SecretEq("admin_password".into());
-        let err = tampered.verify(&ctx_ok).unwrap_err();
-        let msg = err.to_string();
+        // Substitute a caveat with a wider one. Signature should fail
+        // BEFORE caveat evaluation — chain integrity check.
+        let mut substituted = m.clone();
+        substituted.caveats[0] = Caveat::SecretEq("admin_password".into());
+        let err = substituted.verify(&ctx_ok).unwrap_err();
         assert!(
-            msg.contains("signature invalid"),
-            "expected HMAC chain failure, got: {msg}"
+            err.to_string().contains("signature invalid"),
+            "expected HMAC chain failure, got: {err}"
         );
 
-        // Tamper: drop a caveat — same chain failure.
+        // Drop a caveat — same chain failure.
         let mut shorter = m.clone();
         shorter.caveats.pop();
         assert!(shorter.verify(&ctx_ok).is_err());
 
-        // Tamper: reorder caveats — same chain failure.
+        // Reorder caveats — same chain failure.
         let mut reordered = m.clone();
         reordered.caveats.reverse();
         assert!(reordered.verify(&ctx_ok).is_err());
 
-        // Cleanup.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("LLM_SECRETS_DIR", v),
-                None => std::env::remove_var("LLM_SECRETS_DIR"),
-            }
-        }
-    }
-
-    #[test]
-    fn cannot_escalate_by_removing_caveats() {
+        // ---- Property 2: cannot escalate by removing caveats -------------
+        //
         // The defining macaroon property: a holder of an attenuated token
-        // cannot recover the original by removing caveats.
-        let dir = tempfile::tempdir().unwrap();
-        let prev = std::env::var("LLM_SECRETS_DIR").ok();
-        unsafe {
-            std::env::set_var("LLM_SECRETS_DIR", dir.path());
-        }
+        // cannot recover the original authority by removing caveats.
 
-        rotate_root_key().unwrap();
-
-        // Imagine a "wide" token with one caveat...
         let wide = Macaroon::mint(vec![Caveat::SecretEq("db".into())]).unwrap();
-        // ...and a tight token with two.
         let tight = Macaroon::mint(vec![
             Caveat::SecretEq("db".into()),
             Caveat::ExpiresAt(Utc::now() - chrono::Duration::seconds(1)),
         ])
         .unwrap();
-
-        let claims = sample_claims();
-        let ctx = Context {
+        let ctx_db = Context {
             key: "db",
             claims: &claims,
         };
-
-        // Wide one verifies.
-        wide.verify(&ctx).unwrap();
-        // Tight one fails (expired).
-        assert!(tight.verify(&ctx).is_err());
+        wide.verify(&ctx_db).unwrap();
+        assert!(tight.verify(&ctx_db).is_err()); // expired
 
         // Attempt to "escalate" tight by removing the expiry caveat. The
-        // signature does not match a single-caveat chain (the original
-        // signature was computed against TWO caveats), so verify fails.
+        // signature does not match a single-caveat chain — verify fails.
         let mut escalated = tight.clone();
         escalated.caveats.pop();
-        let err = escalated.verify(&ctx).unwrap_err();
+        let err = escalated.verify(&ctx_db).unwrap_err();
         assert!(err.to_string().contains("signature invalid"));
 
+        // Cleanup.
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("LLM_SECRETS_DIR", v),
