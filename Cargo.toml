@@ -1,6 +1,6 @@
 [package]
 name = "llm-secrets"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2024"
 description = "Workload identity for AI agents — prove who you are, access only what you should, for only as long as you need"
 license = "MIT"

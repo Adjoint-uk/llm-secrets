@@ -133,16 +133,13 @@ enum Command {
     /// safe subset of the CLI to AI agents — never returns plaintext.
     Mcp,
 
-    /// Mint, inspect, and verify macaroons (delegated capability tokens).
-    /// See `docs/adr/0006-macaroons.md`.
+    /// Mint, inspect, and verify delegated capability tokens (macaroons)
     Macaroon {
         #[command(subcommand)]
         action: MacaroonCommand,
     },
 
-    /// Profile-driven mint and exec. Profiles are TOML recipes that group
-    /// secrets, env-var mappings, and default caveats. The recipe layer is
-    /// config; the macaroon layer is crypto. See `docs/adr/0008-toml-profiles.md`.
+    /// Profile-driven mint and exec from `~/.config/llm-secrets/profiles.toml`
     Profile {
         #[command(subcommand)]
         action: ProfileCommand,

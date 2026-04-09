@@ -4,6 +4,16 @@ All notable changes to `llm-secrets` will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] — 2026-04-09
+
+Docs + help-text polish. No behavioural changes; safe upgrade from 2.1.0.
+
+### Changed
+
+- **README**: profile-first quickstart. The new `llms profile exec <name>` ergonomic is now the leading example, before the manual `macaroon mint` flow. Commands table grew sections for v2.0 macaroons and v2.1 profiles.
+- **`llms --help`**: `macaroon` and `profile` subcommand descriptions tightened — no more `See docs/adr/...` tails in user-facing help. ADR references stay in code comments.
+- **README status section** updated to v2.1.
+
 ## [2.1.0] — 2026-04-09
 
 **TOML profiles — the recipe layer.** v2.1 adds named profiles that group secrets and env-var mappings into a reusable recipe, eliminating wrapper-script boilerplate when consuming secrets from many tools. Profiles are config (TOML, editable, dotfile-managed); the macaroon they produce is still the unforgeable, time-bounded token. **Two layers, two concerns** — see ADR 0008.

@@ -68,39 +68,65 @@ cargo build --release
 
 ## Quick Start
 
-### Set up the store (one-time)
+### One-time setup
 
 ```bash
+cargo install llm-secrets
+
 llms init                                    # generates an age identity, creates the encrypted store
+llms session-start --ttl 8h                  # mints your root macaroon
 echo "$DB_PASSWORD" | llms set db_password --stdin
 ```
 
-### Direct CLI use (you, in your own terminal)
+### The easy way — profiles (v2.1+)
+
+A **profile** is a TOML recipe that groups secrets and env-var mappings under a name. Edit once, use everywhere. The profile is config; the macaroon it produces at use time is still the unforgeable, time-bounded token.
 
 ```bash
-llms exec --inject DB_PASS=db_password -- psql -U admin mydb
+mkdir -p ~/.config/llm-secrets
+cat > ~/.config/llm-secrets/profiles.toml <<'EOF'
+[db]
+secrets = ["db_password"]
+ttl     = "5m"
+
+[db.env]
+DB_PASS = "db_password"
+EOF
 ```
 
-### Agent use — the recommended pattern (you handing work to an AI agent)
+Then:
 
 ```bash
-# Start a session (signed claim of who/where/what/when)
-llms session-start --ttl 1h
+# You, directly:
+llms profile exec db -- psql -U admin mydb
 
-# Mint a macaroon scoped to exactly this task
+# Or hand a minted token to an agent:
+eval "$(llms profile mint db)"
+claude            # inherits LLM_SECRETS_MACAROON, narrowed to db_password for 5 minutes
+```
+
+Editing the profile is free — no re-minting, no token redistribution. The TOML is non-secret config: stealing it gets you a list of names, no access. The macaroon is the only thing carrying authority, and it's always short-lived and context-restricted.
+
+### The manual way — direct CLI / macaroon mint
+
+For one-off scripts or when you don't want a profile:
+
+```bash
+# Direct CLI (you, in your own terminal):
+llms exec --inject DB_PASS=db_password -- psql -U admin mydb
+
+# Mint a macaroon by hand and hand it to an agent:
 M=$(llms macaroon mint \
     --secret db_password \
     --ttl 5m \
     --branch main \
     --agent claude-code)
-
-# Hand it to the agent. The agent inherits the capability — not your full identity.
 LLM_SECRETS_MACAROON=$M claude
 ```
 
 The agent can use `db_password` via `llms exec` for the next 5 minutes, only on this branch, only as `claude-code`. It cannot read any other secret. It cannot extend the TTL. It cannot remove the caveats. Every access is recorded in the audit log.
 
-When you're done — or if anything looks wrong — `llms revoke-all` deletes the macaroon root key and invalidates every derived token in O(1).
+When you're done — or if anything looks wrong — `llms revoke-all` deletes the macaroon root key and invalidates every derived token in O(1). `llms revoke-all --rotate` additionally re-encrypts the on-disk store under a fresh age key.
 
 ## Commands
 
@@ -130,7 +156,25 @@ When you're done — or if anything looks wrong — `llms revoke-all` deletes th
 | `llms lease <key> --ttl 5m` | Request time-bounded secret access |
 | `llms leases` | List active leases |
 | `llms audit` | View access audit log |
-| `llms revoke-all` | Emergency killswitch |
+| `llms revoke-all [--rotate]` | Emergency killswitch (`--rotate` re-encrypts the store) |
+
+### Capability delegation — macaroons (v2.0)
+
+| Command | Description |
+|---------|-------------|
+| `llms macaroon mint --secret <k> --ttl <t> [--branch <b> --agent <a>]` | Mint a delegated bearer token |
+| `llms macaroon inspect [--macaroon <m>]` | Pretty-print a macaroon (pure parse) |
+| `llms macaroon verify [--macaroon <m>] [--key <k>]` | Verify signature + caveats against current context |
+
+### Profiles — the recipe layer (v2.1)
+
+| Command | Description |
+|---------|-------------|
+| `llms profile list` | List profiles in `~/.config/llm-secrets/profiles.toml` |
+| `llms profile show <name>` | Show secrets, env mapping, ttl, caveats |
+| `llms profile mint <name> [--ttl <t>]` | Mint a macaroon and print `export LLM_SECRETS_MACAROON=…` |
+| `llms profile exec <name> [--ttl <t>] -- <cmd>` | Mint + exec with the profile's env vars injected |
+| `llms exec --profile <name> -- <cmd>` | Alias for `profile exec` |
 
 ## Policy File
 
@@ -183,7 +227,9 @@ Without a policy file, all secrets are accessible (backwards compatible).
 
 ## Status
 
-**v2.0 — released.** The session and the delegated token are **the same primitive** — both are macaroons. There is no other identity object in the system. Reads always travel through a verified token (the dev's root, loaded automatically, or an explicit child handed to an agent). Killswitch is one command. See [ADR 0007](docs/adr/0007-macaroon-merge.md) for the v2.0 design and [CHANGELOG](CHANGELOG.md) for the migration note.
+**v2.1 — released.** Adds **TOML profiles** — named recipes that group secrets and env-var mappings — so consuming many secrets from many tools no longer needs wrapper-script boilerplate. Profiles are config; the macaroons they produce at use time are still the unforgeable, time-bounded tokens. See [ADR 0008](docs/adr/0008-toml-profiles.md) for the design and [CHANGELOG](CHANGELOG.md) for the full notes.
+
+Built on **v2.0**, the macaroon merge: the session and the delegated token are the **same primitive** — both are macaroons. Reads always travel through a verified token. See [ADR 0007](docs/adr/0007-macaroon-merge.md).
 
 ## Contributing
 
