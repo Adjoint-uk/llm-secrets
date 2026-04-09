@@ -14,3 +14,6 @@
 # Local secrets / dev stores
 .llm-secrets/
 *.age
+
+# Internal/private design notes (not for public repo yet)
+docs/internal/
