@@ -4,6 +4,17 @@ All notable changes to `llm-secrets` will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.2] — 2026-04-09
+
+Help text overhaul. `llms --help` now reads as a real cheat-sheet rather than a clap dump. No behavioural changes; safe upgrade from 2.1.1.
+
+### Changed
+
+- **`llms --help`**: top-level `long_about` now opens with the workload-identity pitch in two paragraphs, then walks through the daily workflow, both delegation paths (manual macaroon mint and v2.1 profiles), and the inspect/audit/revoke triad. Ends with a pointer to `llms macaroon --help` and `llms profile --help`.
+- **`llms macaroon --help`**: long_about explains macaroons as the headline primitive (HMAC-SHA256 chain, every caveat enforced, O(1) revocation) with four worked examples covering mint, multi-secret, inspect, and verify.
+- **`llms profile --help`**: long_about lays out the two-layer model (config vs capability), shows the full `profiles.toml` schema, and explains when to use profiles vs manual macaroon mint.
+- **`llms exec --help`**: long_about now shows both `--inject` and `--profile` forms side by side.
+
 ## [2.1.1] — 2026-04-09
 
 Docs + help-text polish. No behavioural changes; safe upgrade from 2.1.0.

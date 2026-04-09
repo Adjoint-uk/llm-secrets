@@ -9,10 +9,68 @@ use crate::store;
 #[derive(Parser)]
 #[command(
     name = "llms",
-    about = "Workload identity for AI agents",
-    long_about = "Prove who you are, access only what you should, for only as long as you need.\n\n\
-        llm-secrets provides identity-based secret access for AI coding agents.\n\
-        Secrets are never exposed to the LLM context — there is no 'get' command.",
+    about = "Workload identity for AI agents — capability delegation, not credential sharing",
+    long_about = "\
+llm-secrets — workload identity for AI coding agents.
+
+You don't *give* your AI agent your credentials. You *delegate* a slice of
+your identity to it — narrowed to one secret, one repo, one branch, five
+minutes — using an attenuated, signed bearer token (a macaroon). The agent
+can use what you've given it. It cannot widen the grant. It cannot escalate.
+
+Secrets never leave the binary as plaintext on stdout. There is no `get`
+command. Architectural enforcement, not behavioural.
+
+DAILY WORKFLOW
+
+  llms session-start --ttl 8h        # mint your root identity for the day
+  llms set db_password               # store a secret (hidden input)
+  llms list                          # see what you have
+
+DELEGATE TO AN AGENT — THE MANUAL WAY
+
+  M=$(llms macaroon mint \\
+      --secret db_password \\
+      --ttl 5m \\
+      --branch main \\
+      --agent claude-code)
+  LLM_SECRETS_MACAROON=$M claude
+
+  # The agent now holds a token narrowed to db_password, 5 min, this branch,
+  # this agent. Removing or substituting any caveat invalidates the HMAC
+  # chain. It can do less than you can — never more.
+
+DELEGATE TO AN AGENT — THE EASY WAY (PROFILES, v2.1+)
+
+  # ~/.config/llm-secrets/profiles.toml:
+  #   [claude-db]
+  #   secrets = [\"db_password\"]
+  #   ttl     = \"5m\"
+  #   branch  = \"main\"
+  #   agent   = \"claude-code\"
+  #   [claude-db.env]
+  #   DB_PASS = \"db_password\"
+
+  eval \"$(llms profile mint claude-db)\"     # mint and export
+  claude                                       # agent inherits the token
+
+  # Or in one step:
+  llms profile exec claude-db -- psql -U admin mydb
+
+  # Profiles ARE macaroons under the hood — they just save you typing the
+  # caveat list every day. Same crypto, same enforcement.
+
+INSPECT, AUDIT, REVOKE
+
+  llms macaroon inspect --macaroon $M    # what does this token allow?
+  llms audit --last 20                   # what did the agent touch?
+  llms revoke-all                        # killswitch — every token dies in O(1)
+  llms revoke-all --rotate               # also re-encrypt the store
+
+For per-command help, run `llms <command> --help`. Start with:
+  llms macaroon --help     (capability delegation — the headline)
+  llms profile --help      (recipes for the same)
+",
     version
 )]
 struct Cli {
@@ -60,6 +118,23 @@ enum Command {
     },
 
     /// Run a command with secrets injected as environment variables
+    #[command(long_about = "\
+Run a child process with secrets injected as environment variables. The
+parent process never holds plaintext for longer than is needed to populate
+the child's env block. The plaintext never appears on stdout.
+
+Two forms:
+
+  # Manual injection — explicit ENV=key mappings
+  llms exec --inject DB_PASS=db_password --inject API=api_key -- psql ...
+
+  # Profile injection — read the env mapping from a TOML profile
+  llms exec --profile iba -- iba-jira list
+
+The profile form is the v2.1 ergonomic. It mints a fresh macaroon from
+the profile's caveats and uses the profile's [env] table to drive the
+ENV=key mappings. Equivalent to `llms profile exec`.
+")]
     Exec {
         /// Secret mappings: ENV_VAR=secret_key (required unless --profile is given)
         #[arg(short, long)]
@@ -134,12 +209,87 @@ enum Command {
     Mcp,
 
     /// Mint, inspect, and verify delegated capability tokens (macaroons)
+    #[command(long_about = "\
+Macaroons are the headline. They are signed, attenuated, time-bounded
+bearer tokens that let you delegate a slice of your identity to an AI
+agent without handing over your full credentials.
+
+Every caveat (secret, ttl, repo, branch, agent, who) is enforced by an
+HMAC-SHA256 chain rooted in the per-session key. Removing, substituting,
+or reordering any caveat breaks the chain. Verification needs only the
+root key + the full caveat list — no oracle, no daemon, no network.
+
+Revocation is one command: `llms revoke-all` deletes the root key, every
+issued macaroon (and its delegated children) becomes unverifiable in O(1).
+
+EXAMPLES
+
+  # Narrow grant: one secret, 5 minutes, only on this branch and agent.
+  M=$(llms macaroon mint \\
+      --secret db_password --ttl 5m \\
+      --branch main --agent claude-code)
+  LLM_SECRETS_MACAROON=$M claude
+
+  # Multiple secrets in one token (becomes a `secrets_in [...]` caveat).
+  llms macaroon mint --secret db_password --secret api_key --ttl 1h
+
+  # Inspect a token someone gave you (pure parse, never touches the store).
+  llms macaroon inspect --macaroon $M
+
+  # Verify the token is currently valid in this context.
+  llms macaroon verify --macaroon $M --key db_password
+")]
     Macaroon {
         #[command(subcommand)]
         action: MacaroonCommand,
     },
 
-    /// Profile-driven mint and exec from `~/.config/llm-secrets/profiles.toml`
+    /// Profile-driven mint and exec from ~/.config/llm-secrets/profiles.toml
+    #[command(long_about = "\
+Profiles are TOML recipes that group secrets, env-var mappings, and
+default caveats under a name. They are CONFIG, not tokens. The macaroon
+they produce at use time is the unforgeable, time-bounded thing.
+
+Two layers, two concerns:
+  - Profile (TOML, editable, dotfile-managed): the recipe.
+  - Macaroon (signed, in-memory, short-lived):  the capability.
+
+Stealing a profiles.toml gets you a list of secret NAMES. No access.
+The macaroon is the only thing that ever carries authority, and it is
+always narrow and short-lived.
+
+PROFILE FILE LAYOUT (~/.config/llm-secrets/profiles.toml)
+
+  [iba]
+  secrets = [\"iba_ad_username\", \"iba_ad_password\", \"iba_jira_api_key\"]
+  ttl     = \"8h\"
+  agent   = \"claude-code\"     # optional caveat
+  branch  = \"main\"            # optional caveat
+  repo    = \"adjoint-uk/llm-secrets\"  # optional caveat
+
+  [iba.env]
+  IBA_AD_USERNAME = \"iba_ad_username\"
+  IBA_AD_PASSWORD = \"iba_ad_password\"
+  IBA_JIRA_TOKEN  = \"iba_jira_api_key\"
+
+EXAMPLES
+
+  llms profile list                          # what's defined?
+  llms profile show iba                      # secrets, env, caveats
+  llms profile exec iba -- iba-jira list     # mint + exec in one step
+  eval \"$(llms profile mint iba)\"            # mint into shell env
+  llms exec --profile iba -- ./deploy.sh     # alias for `profile exec`
+
+WHEN TO USE PROFILES VS MANUAL MACAROON MINT
+
+  Profile:  same delegation pattern repeated daily. Eliminates wrapper
+            scripts and repeated `--secret X --ttl Y --branch Z` typing.
+  Manual:   one-off task, exploring, custom caveats not in any profile,
+            or when you want to be explicit about every constraint.
+
+  The macaroon under both paths is the same shape. Profiles are not a
+  different security model — they are a typing-saver over the same primitive.
+")]
     Profile {
         #[command(subcommand)]
         action: ProfileCommand,
