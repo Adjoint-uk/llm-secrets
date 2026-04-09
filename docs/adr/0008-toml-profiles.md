@@ -1,9 +1,10 @@
 # ADR 0008 — TOML profile definitions (the recipe layer)
 
-- **Status**: Proposed
+- **Status**: Accepted (shipped in v2.1.0, 2026-04-09)
 - **Date**: 2026-04-09
 - **Builds on**: ADR 0006 (macaroons), ADR 0007 (one-primitive macaroon model)
 - **Internal design notes**: `docs/internal/v2.1-mint-macaroon-profiles.md`
+- **Implemented in**: `src/profile.rs`, `src/cli.rs` (`Profile` subcommand), `tests/cli.rs` (profile_*)
 
 ## Context
 

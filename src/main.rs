@@ -5,6 +5,7 @@ mod lease;
 mod macaroon;
 mod mcp;
 mod policy;
+mod profile;
 mod store;
 
 fn main() {

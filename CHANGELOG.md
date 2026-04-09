@@ -4,6 +4,40 @@ All notable changes to `llm-secrets` will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-04-09
+
+**TOML profiles — the recipe layer.** v2.1 adds named profiles that group secrets and env-var mappings into a reusable recipe, eliminating wrapper-script boilerplate when consuming secrets from many tools. Profiles are config (TOML, editable, dotfile-managed); the macaroon they produce is still the unforgeable, time-bounded token. **Two layers, two concerns** — see ADR 0008.
+
+Purely additive. v2.0 users see no behavioural change. The macaroon code path is unchanged.
+
+### Added
+
+- `src/profile.rs` — `Profile` type, `load`, `list`, `validate`, `to_caveats`. ~310 LOC.
+- `llms profile list` — list profiles defined in `profiles.toml`.
+- `llms profile show <name>` — secrets, env mapping, ttl, caveats.
+- `llms profile mint <name> [--ttl X]` — print `export LLM_SECRETS_MACAROON=...`.
+- `llms profile exec <name> [--ttl X] -- <cmd>` — mint + exec with env vars injected.
+- `llms exec --profile <name>` — alias for `profile exec`.
+- `LLM_SECRETS_CONFIG_DIR` env var — overrides the profile config directory (default `$XDG_CONFIG_HOME/llm-secrets`). Mostly for tests; real users edit `~/.config/llm-secrets/profiles.toml`.
+- `revoke-all --rotate` — actually re-encrypts the store under a fresh age key now (was `not implemented yet` in v2.0). New `store::rotate_age_key()`.
+- Audit events: `profile.mint`, `profile.exec`.
+- 15 new tests (profile unit + integration + rotate + friendly-error).
+
+### Changed
+
+- `Error::NoSession` message is now plain English with the suggested fix: *"no active session — run `llms session-start` (or `llms session-start --ttl 8h`)"*. The `gate()` no longer wraps it in `PolicyDenied` — `NoSession` bubbles up directly. (ADR 0008 open question 7.)
+- `llms exec` no longer requires `--inject` when `--profile` is given. The two are mutually exclusive.
+
+### Architectural notes
+
+- The macaroon code (`src/macaroon.rs`, `Caveat` enum, signature chain, verification) is **completely unchanged**. v2.1 is one new module + CLI glue.
+- The env mapping lives **only** in the TOML, never in a caveat. Cross-machine delegation (where the receiver lacks the toml) is a Phase 2 concern; if it ever becomes a real workflow we'd add an `EnvMap` caveat then.
+- `profiles.toml` confers no authority. Stealing it gets you a list of secret names — no access. Macaroons remain the only bearer authority and are still short-lived and context-restricted.
+
+### Tests
+
+- Total: 52 (26 unit + 26 integration), up from 37 in v2.0.
+
 ## [2.0.0] — 2026-04-08
 
 **One primitive: the session is a macaroon.** v2.0 collapses the two parallel identity concepts (Ed25519-signed sessions and HMAC-chained macaroons) into a single object. The dev's session is the **root macaroon**. A delegated agent token is a **child macaroon derived from that root**. There is no other identity object in the system.

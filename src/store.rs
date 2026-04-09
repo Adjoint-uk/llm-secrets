@@ -169,6 +169,34 @@ pub fn save_store(store: &Store, recipient: &Recipient) -> Result<()> {
     Ok(())
 }
 
+/// Rotate the age keypair: decrypt the store under the current identity,
+/// generate a fresh identity, re-encrypt the store under the new recipient,
+/// and atomically swap both files. Used by `revoke-all --rotate`.
+///
+/// Crash-safety note: between the two atomic renames there is a microsecond
+/// window where store.age is encrypted with the new key but identity.txt
+/// still points at the old key (or vice-versa). A crash in that window
+/// requires restoring identity.txt from backup. Acceptable for an emergency
+/// killswitch operation; documented in `docs/SECURITY-MODEL.md`.
+pub fn rotate_age_key() -> Result<()> {
+    let old_identity = load_identity()?;
+    let store = load_store(&old_identity)?;
+
+    let new_identity = Identity::generate();
+    let new_recipient = new_identity.to_public();
+
+    // Order: write the new store first (encrypted under new recipient),
+    // then swap the identity. If the second step fails, restoring the
+    // identity from backup recovers the store.
+    save_store(&store, &new_recipient)?;
+    let id_path = identity_path()?;
+    write_secret_file(
+        &id_path,
+        new_identity.to_string().expose_secret().as_bytes(),
+    )?;
+    Ok(())
+}
+
 // ---- atomic file helpers --------------------------------------------------
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {

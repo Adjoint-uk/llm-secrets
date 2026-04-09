@@ -1,6 +1,6 @@
 [package]
 name = "llm-secrets"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "Workload identity for AI agents — prove who you are, access only what you should, for only as long as you need"
 license = "MIT"
@@ -31,6 +31,7 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
+toml = "0.8"
 
 [dev-dependencies]
 assert_cmd = "2"

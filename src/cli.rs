@@ -61,9 +61,16 @@ enum Command {
 
     /// Run a command with secrets injected as environment variables
     Exec {
-        /// Secret mappings: ENV_VAR=secret_key
-        #[arg(short, long, required = true)]
+        /// Secret mappings: ENV_VAR=secret_key (required unless --profile is given)
+        #[arg(short, long)]
         inject: Vec<String>,
+        /// Use a TOML profile (alias for `llms profile exec <name>`).
+        /// Mints a fresh macaroon from the profile and injects its env map.
+        #[arg(long, conflicts_with = "inject", conflicts_with = "macaroon")]
+        profile: Option<String>,
+        /// Override the profile's default TTL (only valid with --profile)
+        #[arg(long, requires = "profile")]
+        ttl: Option<String>,
         /// Present a macaroon (also honoured: $LLM_SECRETS_MACAROON)
         #[arg(long)]
         macaroon: Option<String>,
@@ -132,6 +139,45 @@ enum Command {
         #[command(subcommand)]
         action: MacaroonCommand,
     },
+
+    /// Profile-driven mint and exec. Profiles are TOML recipes that group
+    /// secrets, env-var mappings, and default caveats. The recipe layer is
+    /// config; the macaroon layer is crypto. See `docs/adr/0008-toml-profiles.md`.
+    Profile {
+        #[command(subcommand)]
+        action: ProfileCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// List profiles defined in profiles.toml.
+    List,
+    /// Show a profile's secrets, env mapping, and caveats.
+    Show {
+        /// Profile name
+        name: String,
+    },
+    /// Mint a macaroon from a profile and print it as an export line.
+    Mint {
+        /// Profile name
+        name: String,
+        /// Override the profile's default TTL
+        #[arg(long)]
+        ttl: Option<String>,
+    },
+    /// Mint a macaroon from a profile and exec a command with the profile's
+    /// env mappings injected. Equivalent to `llms exec --profile <name>`.
+    Exec {
+        /// Profile name
+        name: String,
+        /// Override the profile's default TTL
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Command to run
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -193,9 +239,22 @@ pub fn run() -> Result<()> {
         Command::Delete { key, force } => cmd_delete(&key, force),
         Command::Exec {
             inject,
+            profile,
+            ttl,
             macaroon,
             command,
-        } => cmd_exec(inject, macaroon, command),
+        } => {
+            if let Some(name) = profile {
+                cmd_profile_exec(&name, ttl, command)
+            } else {
+                if inject.is_empty() {
+                    return Err(Error::Other(
+                        "exec requires --inject ENV=key (or --profile <name>)".into(),
+                    ));
+                }
+                cmd_exec(inject, macaroon, command)
+            }
+        }
         Command::Status => cmd_status(),
         Command::SessionStart { ttl } => cmd_session_start(&ttl),
         Command::SessionInfo => cmd_session_info(),
@@ -215,6 +274,12 @@ pub fn run() -> Result<()> {
             } => cmd_macaroon_mint(secret, &ttl, repo, branch, agent, who),
             MacaroonCommand::Inspect { macaroon } => cmd_macaroon_inspect(macaroon),
             MacaroonCommand::Verify { macaroon, key } => cmd_macaroon_verify(macaroon, key),
+        },
+        Command::Profile { action } => match action {
+            ProfileCommand::List => cmd_profile_list(),
+            ProfileCommand::Show { name } => cmd_profile_show(&name),
+            ProfileCommand::Mint { name, ttl } => cmd_profile_mint(&name, ttl),
+            ProfileCommand::Exec { name, ttl, command } => cmd_profile_exec(&name, ttl, command),
         },
     }
 }
@@ -283,10 +348,9 @@ fn gate<'a>(key: &'a str, flag: &Option<String>) -> Result<crate::macaroon::Cont
     let m = if let Some(encoded) = crate::macaroon::pick_macaroon(flag) {
         crate::macaroon::Macaroon::decode(&encoded)?
     } else {
-        crate::macaroon::Macaroon::load_root().map_err(|_| Error::PolicyDenied {
-            key: key.to_string(),
-            reason: "no active session and no macaroon presented — run `llms session-start`".into(),
-        })?
+        // NoSession's Display already says "no active session — run
+        // `llms session-start`" (see ADR 0008 open-q #7).
+        crate::macaroon::Macaroon::load_root()?
     };
     m.verify(&ctx)?;
     Ok(ctx)
@@ -527,14 +591,12 @@ fn cmd_audit(json: bool, last: usize) -> Result<()> {
 }
 
 fn cmd_revoke_all(rotate: bool) -> Result<()> {
-    if rotate {
-        return Err(Error::Other(
-            "--rotate is reserved for re-encrypting the store under a fresh age key (planned)"
-                .into(),
-        ));
-    }
     let count = crate::lease::revoke_all()?;
     println!("revoked {count} leases, the root macaroon, and the macaroon root key");
+    if rotate {
+        crate::store::rotate_age_key()?;
+        println!("re-encrypted store under a fresh age key");
+    }
     Ok(())
 }
 
@@ -611,6 +673,103 @@ fn cmd_macaroon_verify(macaroon: Option<String>, key: Option<String>) -> Result<
         m.caveats.len()
     );
     Ok(())
+}
+
+// ---- profile commands (v2.1: TOML recipes → caveats → existing mint) ----
+
+fn cmd_profile_list() -> Result<()> {
+    let profiles = crate::profile::Profile::list()?;
+    if profiles.is_empty() {
+        println!("(no profiles)");
+        return Ok(());
+    }
+    for p in &profiles {
+        println!(
+            "{:16}  {} secret(s), ttl {}",
+            p.name,
+            p.secrets.len(),
+            crate::profile::format_duration(p.ttl)
+        );
+    }
+    Ok(())
+}
+
+fn cmd_profile_show(name: &str) -> Result<()> {
+    let p = crate::profile::Profile::load(name)?;
+    println!("profile:  {}", p.name);
+    println!("secrets:  {}", p.secrets.join(", "));
+    if !p.env.is_empty() {
+        let max = p.env.keys().map(|k| k.len()).max().unwrap_or(0);
+        println!("env:");
+        for (env, key) in &p.env {
+            println!("  {env:<max$} <- {key}");
+        }
+    }
+    println!("ttl:      {}", crate::profile::format_duration(p.ttl));
+    let extras: Vec<String> = [
+        p.repo.as_ref().map(|r| format!("repo == {r}")),
+        p.branch.as_ref().map(|b| format!("branch == {b}")),
+        p.agent.as_ref().map(|a| format!("agent == {a}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if extras.is_empty() {
+        println!("caveats:  (none beyond secrets+ttl)");
+    } else {
+        println!("caveats:  {}", extras.join(", "));
+    }
+    Ok(())
+}
+
+fn cmd_profile_mint(name: &str, ttl_override: Option<String>) -> Result<()> {
+    let p = crate::profile::Profile::load(name)?;
+    let ttl = ttl_override
+        .as_deref()
+        .map(crate::macaroon::parse_duration)
+        .transpose()?;
+    let root = crate::macaroon::Macaroon::load_root()?;
+    let child = root.delegate(p.to_caveats(ttl))?;
+    let encoded = child.encode()?;
+    println!("export LLM_SECRETS_MACAROON={encoded}");
+    let ctx = crate::macaroon::Context::current("(profile)");
+    let _ = crate::lease::audit("profile.mint", &ctx, Some(format!("profile={}", p.name)));
+    Ok(())
+}
+
+fn cmd_profile_exec(name: &str, ttl_override: Option<String>, command: Vec<String>) -> Result<()> {
+    if command.is_empty() {
+        return Err(Error::Other("no command provided after `--`".into()));
+    }
+    let p = crate::profile::Profile::load(name)?;
+    if p.env.is_empty() {
+        return Err(Error::Other(format!(
+            "profile '{}' has no [env] mappings — nothing to inject",
+            p.name
+        )));
+    }
+    let ttl = ttl_override
+        .as_deref()
+        .map(crate::macaroon::parse_duration)
+        .transpose()?;
+    let root = crate::macaroon::Macaroon::load_root()?;
+    let child = root.delegate(p.to_caveats(ttl))?;
+    let encoded = child.encode()?;
+
+    let inject: Vec<String> = p
+        .env
+        .iter()
+        .map(|(env_var, secret_key)| format!("{env_var}={secret_key}"))
+        .collect();
+
+    let ctx = crate::macaroon::Context::current("(profile)");
+    let _ = crate::lease::audit(
+        "profile.exec",
+        &ctx,
+        Some(format!("profile={} command={}", p.name, command[0])),
+    );
+
+    cmd_exec(inject, Some(encoded), command)
 }
 
 /// Read a macaroon from `--macaroon`, or `LLM_SECRETS_MACAROON`, or stdin

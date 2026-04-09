@@ -519,6 +519,305 @@ fn session_info_without_session_errors() {
         .failure();
 }
 
+// ---- v2.1: TOML profiles --------------------------------------------------
+
+fn write_profiles(config_dir: &std::path::Path, body: &str) {
+    std::fs::create_dir_all(config_dir).unwrap();
+    std::fs::write(config_dir.join("profiles.toml"), body).unwrap();
+}
+
+#[test]
+fn profile_list_and_show() {
+    let dir = fresh_store();
+    let cfg = tempfile::tempdir().unwrap();
+    write_profiles(
+        cfg.path(),
+        r#"
+[iba]
+secrets = ["a", "b"]
+ttl = "8h"
+
+[iba.env]
+A = "a"
+B = "b"
+"#,
+    );
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .env("LLM_SECRETS_CONFIG_DIR", cfg.path())
+        .args(["profile", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("iba"))
+        .stdout(predicate::str::contains("2 secret"));
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .env("LLM_SECRETS_CONFIG_DIR", cfg.path())
+        .args(["profile", "show", "iba"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("profile:  iba"))
+        .stdout(predicate::str::contains("ttl:      8h"))
+        .stdout(predicate::str::contains("A <- a"));
+}
+
+#[test]
+fn profile_mint_then_use_via_env() {
+    let dir = fresh_store();
+    let cfg = tempfile::tempdir().unwrap();
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .args(["set", "api_key", "--stdin"])
+        .write_stdin("sk-prof-1")
+        .assert()
+        .success();
+
+    write_profiles(
+        cfg.path(),
+        r#"
+[svc]
+secrets = ["api_key"]
+ttl = "5m"
+
+[svc.env]
+API = "api_key"
+"#,
+    );
+
+    let mint = llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .env("LLM_SECRETS_CONFIG_DIR", cfg.path())
+        .args(["profile", "mint", "svc"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(mint.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.starts_with("export LLM_SECRETS_MACAROON="),
+        "{stdout}"
+    );
+    let macaroon = stdout
+        .trim()
+        .strip_prefix("export LLM_SECRETS_MACAROON=")
+        .unwrap()
+        .to_string();
+
+    // Use the minted macaroon via env var on a plain exec.
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .env("LLM_SECRETS_MACAROON", &macaroon)
+        .args([
+            "exec",
+            "--inject",
+            "API=api_key",
+            "--",
+            "sh",
+            "-c",
+            "printf %s \"$API\"",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::diff("sk-prof-1"));
+}
+
+#[test]
+fn profile_exec_injects_env_vars() {
+    let dir = fresh_store();
+    let cfg = tempfile::tempdir().unwrap();
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .args(["set", "user", "--stdin"])
+        .write_stdin("alice")
+        .assert()
+        .success();
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .args(["set", "token", "--stdin"])
+        .write_stdin("t0p")
+        .assert()
+        .success();
+
+    write_profiles(
+        cfg.path(),
+        r#"
+[svc]
+secrets = ["user", "token"]
+ttl = "5m"
+
+[svc.env]
+USER_NAME = "user"
+USER_TOKEN = "token"
+"#,
+    );
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .env("LLM_SECRETS_CONFIG_DIR", cfg.path())
+        .args([
+            "profile",
+            "exec",
+            "svc",
+            "--",
+            "sh",
+            "-c",
+            "printf %s:%s \"$USER_NAME\" \"$USER_TOKEN\"",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::diff("alice:t0p"));
+}
+
+#[test]
+fn exec_profile_alias_works() {
+    let dir = fresh_store();
+    let cfg = tempfile::tempdir().unwrap();
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .args(["set", "k", "--stdin"])
+        .write_stdin("v")
+        .assert()
+        .success();
+
+    write_profiles(
+        cfg.path(),
+        r#"
+[svc]
+secrets = ["k"]
+ttl = "5m"
+
+[svc.env]
+K = "k"
+"#,
+    );
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .env("LLM_SECRETS_CONFIG_DIR", cfg.path())
+        .args([
+            "exec",
+            "--profile",
+            "svc",
+            "--",
+            "sh",
+            "-c",
+            "printf %s \"$K\"",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::diff("v"));
+}
+
+#[test]
+fn profile_not_found_errors() {
+    let dir = fresh_store();
+    let cfg = tempfile::tempdir().unwrap();
+    write_profiles(
+        cfg.path(),
+        r#"[other]
+secrets = ["x"]
+ttl = "1h"
+"#,
+    );
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .env("LLM_SECRETS_CONFIG_DIR", cfg.path())
+        .args(["profile", "show", "missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn profile_dangling_env_reference_errors() {
+    let dir = fresh_store();
+    let cfg = tempfile::tempdir().unwrap();
+    write_profiles(
+        cfg.path(),
+        r#"[svc]
+secrets = ["a"]
+ttl = "1h"
+
+[svc.env]
+A = "a"
+B = "missing"
+"#,
+    );
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .env("LLM_SECRETS_CONFIG_DIR", cfg.path())
+        .args(["profile", "show", "svc"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing"))
+        .stderr(predicate::str::contains("not in the profile"));
+}
+
+#[test]
+fn revoke_all_with_rotate_re_encrypts_store() {
+    let dir = fresh_store();
+    let env_dir = dir.path();
+
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["set", "k", "--stdin"])
+        .write_stdin("v")
+        .assert()
+        .success();
+
+    let old_identity = std::fs::read_to_string(env_dir.join("identity.txt")).unwrap();
+
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["revoke-all", "--rotate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("re-encrypted store"));
+
+    let new_identity = std::fs::read_to_string(env_dir.join("identity.txt")).unwrap();
+    assert_ne!(old_identity, new_identity, "identity should have rotated");
+
+    // Store still readable: start a new session and peek the seeded key.
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["session-start", "--ttl", "1h"])
+        .assert()
+        .success();
+    llms()
+        .env("LLM_SECRETS_DIR", env_dir)
+        .args(["peek", "k"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn no_active_session_error_is_friendly() {
+    let dir = tempfile::tempdir().unwrap();
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .arg("init")
+        .assert()
+        .success();
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .args(["set", "k", "--stdin"])
+        .write_stdin("v")
+        .assert()
+        .success();
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .args(["peek", "k"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no active session"))
+        .stderr(predicate::str::contains("session-start"));
+}
+
 #[test]
 fn exec_with_missing_command_after_dash_dash_errors() {
     let dir = fresh_store();
