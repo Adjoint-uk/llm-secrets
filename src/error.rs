@@ -24,7 +24,7 @@ pub enum Error {
     #[error("lease expired: {0}")]
     LeaseExpired(String),
 
-    #[error("no active session — run `llms session-start` (or `llms session-start --ttl 8h`)")]
+    #[error("no active session — run `llms session-start --ttl 8h` to create one")]
     NoSession,
 
     #[error("io error: {0}")]

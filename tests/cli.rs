@@ -796,7 +796,7 @@ fn revoke_all_with_rotate_re_encrypts_store() {
 }
 
 #[test]
-fn no_active_session_error_is_friendly() {
+fn peek_auto_mints_session_when_none_exists() {
     let dir = tempfile::tempdir().unwrap();
     llms()
         .env("LLM_SECRETS_DIR", dir.path())
@@ -809,13 +809,31 @@ fn no_active_session_error_is_friendly() {
         .write_stdin("v")
         .assert()
         .success();
+    // No session-start — peek should auto-mint and succeed.
     llms()
         .env("LLM_SECRETS_DIR", dir.path())
         .args(["peek", "k"])
         .assert()
+        .success();
+    // session.json should now exist (auto-minted).
+    assert!(dir.path().join("session.json").exists());
+}
+
+#[test]
+fn macaroon_mint_still_requires_explicit_session() {
+    let dir = tempfile::tempdir().unwrap();
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .arg("init")
+        .assert()
+        .success();
+    // No session-start — macaroon mint should fail.
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .args(["macaroon", "mint", "--secret", "k", "--ttl", "5m"])
+        .assert()
         .failure()
-        .stderr(predicate::str::contains("no active session"))
-        .stderr(predicate::str::contains("session-start"));
+        .stderr(predicate::str::contains("no active session"));
 }
 
 #[test]

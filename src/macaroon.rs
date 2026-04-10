@@ -249,6 +249,23 @@ impl Macaroon {
         Ok(m)
     }
 
+    /// Load the root macaroon, or silently mint a fresh one with a 1h TTL
+    /// if no session exists. Used by the direct-CLI read path (`gate()`)
+    /// and MCP peek — operations where the user is acting directly, not
+    /// delegating to an agent. Delegation commands (`macaroon mint`,
+    /// `profile mint/exec`) intentionally call `load_root()` so they
+    /// fail if no session exists.
+    pub fn load_or_auto_mint() -> Result<Self> {
+        match Self::load_root() {
+            Ok(m) => Ok(m),
+            Err(Error::NoSession) => {
+                std::fs::create_dir_all(crate::store::store_dir()?)?;
+                Self::mint_root(Duration::hours(1))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Load the root macaroon from `session.json`. Errors if no session exists.
     pub fn load_root() -> Result<Self> {
         let path = session_path()?;

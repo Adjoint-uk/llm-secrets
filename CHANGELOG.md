@@ -4,6 +4,23 @@ All notable changes to `llm-secrets` will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] — 2026-04-10
+
+**Lazy auto-mint sessions.** Read operations (`peek`, `exec`, `lease`) no longer require an explicit `llms session-start` first. If no session exists on the direct-CLI path, a 1h session is silently auto-minted. Delegation commands (`macaroon mint`, `profile mint/exec`) still require an explicit session — that's the conscious "I'm delegating to an agent" gesture.
+
+### Changed
+
+- **`Macaroon::load_or_auto_mint()`**: new method used by `gate()` and MCP `peek_secret`. Auto-mints a 1h root macaroon when no session exists and no explicit macaroon is presented. Only fires on `NoSession`, not on corrupt sessions.
+- **`session-start`**: still works, now optional for basic use. Use it for longer TTLs (e.g. `--ttl 8h` for a workday), explicit root-key rotation, or before delegation workflows.
+- **`--help`**: daily workflow section updated — `session-start` moves from "required first step" to "optional power-user step".
+- **`Error::NoSession` message**: shortened (only shown for delegation commands now).
+- Stale `v0.3`/`v0.4` section comments cleaned up in `cli.rs`.
+
+### Tests
+
+- `no_active_session_error_is_friendly` → replaced by `peek_auto_mints_session_when_none_exists` (expects success, verifies `session.json` created).
+- New: `macaroon_mint_still_requires_explicit_session` (verifies delegation path still demands a session).
+
 ## [2.1.2] — 2026-04-09
 
 Help text overhaul. `llms --help` now reads as a real cheat-sheet rather than a clap dump. No behavioural changes; safe upgrade from 2.1.1.

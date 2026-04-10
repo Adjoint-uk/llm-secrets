@@ -23,9 +23,12 @@ command. Architectural enforcement, not behavioural.
 
 DAILY WORKFLOW
 
-  llms session-start --ttl 8h        # mint your root identity for the day
   llms set db_password               # store a secret (hidden input)
   llms list                          # see what you have
+  llms peek db_password              # auto-creates a session if needed
+
+  # Optional: explicit session for longer TTL or fresh root key
+  llms session-start --ttl 8h
 
 DELEGATE TO AN AGENT — THE MANUAL WAY
 
@@ -157,8 +160,10 @@ ENV=key mappings. Equivalent to `llms profile exec`.
     /// Check store status and dependencies
     Status,
 
-    // --- v0.3: Agent Identity ---
-    /// Start an authenticated agent session
+    /// Start a session (or refresh the current one with a new TTL)
+    ///
+    /// Optional for basic use — reads auto-create a 1h session if needed.
+    /// Use this to set a longer TTL or force a fresh root key.
     #[command(name = "session-start")]
     SessionStart {
         /// Session TTL (e.g., 1h, 30m)
@@ -170,7 +175,6 @@ ENV=key mappings. Equivalent to `llms profile exec`.
     #[command(name = "session-info")]
     SessionInfo,
 
-    // --- v0.4: Temporal Enforcement ---
     /// Request a time-bounded lease for a secret
     Lease {
         /// Secret key name
@@ -486,8 +490,10 @@ fn cmd_peek(key: &str, chars: usize, macaroon: Option<String>) -> Result<()> {
 ///    the dev's **root macaroon** loaded from `session.json` (the
 ///    direct-CLI path). One of the two must verify.
 ///
-/// There is no "no macaroon" path. If neither an explicit nor a root
-/// macaroon is available, the operation fails closed with a clear error.
+/// There is no "no macaroon" path. Every read goes through a verified
+/// token. For the direct-CLI path (no explicit `--macaroon`), a 1h
+/// session is silently auto-minted if none exists — so the user never
+/// has to remember `session-start` for basic use.
 fn gate<'a>(key: &'a str, flag: &Option<String>) -> Result<crate::macaroon::Context<'a>> {
     let ctx = crate::macaroon::Context::current(key);
     crate::policy::check_access(&ctx)?;
@@ -495,9 +501,7 @@ fn gate<'a>(key: &'a str, flag: &Option<String>) -> Result<crate::macaroon::Cont
     let m = if let Some(encoded) = crate::macaroon::pick_macaroon(flag) {
         crate::macaroon::Macaroon::decode(&encoded)?
     } else {
-        // NoSession's Display already says "no active session — run
-        // `llms session-start`" (see ADR 0008 open-q #7).
-        crate::macaroon::Macaroon::load_root()?
+        crate::macaroon::Macaroon::load_or_auto_mint()?
     };
     m.verify(&ctx)?;
     Ok(ctx)

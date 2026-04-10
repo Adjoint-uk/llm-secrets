@@ -198,7 +198,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value> {
             // v2.0: every read requires a verified macaroon (the dev's root,
             // since the MCP server runs in the dev's process and inherits
             // their identity). Policy is layered on top.
-            let root = crate::macaroon::Macaroon::load_root()?;
+            let root = crate::macaroon::Macaroon::load_or_auto_mint()?;
             let ctx = crate::macaroon::Context::current(key);
             root.verify(&ctx)?;
             crate::policy::check_access(&ctx)?;
