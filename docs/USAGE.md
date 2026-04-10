@@ -1,6 +1,20 @@
 # Usage
 
-A walkthrough of every `llms` command. For *why* the tool is shaped this way, read the [README](../README.md) and the [ADRs](adr/).
+`llm-secrets` has two use cases. They share the same store and the same
+commands, but the *reason* you're using the tool is different, and that
+changes which commands matter.
+
+1. **You, in your terminal** — running commands that need secrets
+   (`psql`, deploy scripts, API calls). `llms` keeps secrets out of
+   `.env` files, shell history, and terminal scrollback.
+
+2. **Delegating to an AI agent** — handing a narrow, time-bounded,
+   revocable slice of your identity to Claude Code / Cursor / Copilot.
+   The agent gets only what it needs, only for as long as it needs it,
+   and you can kill the grant instantly.
+
+For *why* the tool is shaped this way, read the [README](../README.md)
+and the [ADRs](adr/).
 
 ## Install
 
@@ -8,70 +22,218 @@ A walkthrough of every `llms` command. For *why* the tool is shaped this way, re
 cargo install llm-secrets
 ```
 
-Or grab a pre-built binary from the [Releases](https://github.com/adjoint-uk/llm-secrets/releases) page.
+Or grab a pre-built binary from the
+[Releases](https://github.com/adjoint-uk/llm-secrets/releases) page.
 
-## Initialise the store
+## Setup (one-time)
 
 ```bash
 llms init
 ```
 
-Creates `~/.llm-secrets/` (mode 0700) containing:
+Creates `~/.llm-secrets/` containing:
 
-- `identity.txt` — your age secret key. **Back this up.** Without it, the store is unrecoverable.
-- `store.age` — the encrypted JSON store. Empty at first.
+- `identity.txt` — your age secret key. **Back this up.** Lose it, lose the store.
+- `store.age` — the encrypted JSON store.
 
 Override the location with `LLM_SECRETS_DIR=/path/to/dir`.
 
-## Storing and inspecting secrets
-
 ```bash
-# Interactive — hidden input, value never in shell history
+# Add secrets (hidden input — never in shell history)
 llms set db_password
 
-# Piped — useful for scripted setup or migrating from another tool
-echo "hunter2" | llms set db_password --stdin
+# Or pipe from another tool / migration script
+echo "$DB_PASSWORD" | llms set db_password --stdin
 
-# List names (no values)
+# See what you have
 llms list
 
-# Masked preview — shows you which secret you're looking at without
-# leaking the value to your terminal scrollback
+# Masked preview (never the full value)
 llms peek db_password
-# → hunt**ter2
-
-# Delete (asks for confirmation)
-llms delete db_password
-llms delete db_password --force
+# → hunt****ter2
 ```
 
-## Running a command with secrets injected
+---
 
-This is the **only** way plaintext leaves the binary, and it goes straight into a child process's environment — never your shell, never stdout, never an LLM context.
+## Use Case 1: You, in your terminal
+
+This is daily driving. You need secrets injected into a child process.
+No sessions, no macaroons, no ceremony — just `exec`.
+
+### One-off commands
 
 ```bash
+# Inject one secret
 llms exec --inject DB_PASS=db_password -- psql -U admin mydb
+
+# Inject several
 llms exec \
     --inject DB_PASS=db_password \
     --inject API_KEY=stripe_key \
     -- ./run-tests.sh
 ```
 
-`exec` exits with the child's exit code.
+The plaintext goes into the child process's environment, never your
+shell, never stdout, never an LLM context. `exec` exits with the
+child's exit code.
 
-## Sessions and policy
+### Profiles — the repeatable way
 
-A **session** is a signed, time-bounded statement of *who* is asking. Once you have a session, you can apply a policy to control which secrets are reachable.
+When you find yourself typing the same `--inject` flags every day,
+define a profile in `~/.config/llm-secrets/profiles.toml`:
 
-```bash
-# Start a session — gathers git config + repo + branch + agent + pid + ttl
-llms session-start --ttl 1h
+```toml
+[mydb]
+secrets = ["db_password"]
+ttl     = "1h"
 
-# Inspect (verifies the signature and the expiry)
-llms session-info
+[mydb.env]
+DB_PASS = "db_password"
+
+[deploy]
+secrets = ["db_password", "api_key"]
+ttl     = "30m"
+
+[deploy.env]
+DB_PASS = "db_password"
+API_KEY = "api_key"
 ```
 
-To enforce a policy, drop a `.llm-secrets-policy.yaml` at the **git root** of the repo you're working in:
+Then:
+
+```bash
+llms profile list                                    # what's defined?
+llms profile show deploy                             # secrets, env map, caveats
+llms profile exec mydb -- psql -U admin mydb         # one command
+llms profile exec deploy -- ./deploy.sh              # multiple secrets
+llms exec --profile deploy -- ./deploy.sh            # alias, same thing
+```
+
+Profiles are config (TOML, editable, dotfile-managed). Stealing one
+gets you a list of secret *names*, not values. Under the hood, `profile
+exec` mints a short-lived macaroon and uses it for the `exec` — but you
+never need to think about that.
+
+### That's it
+
+For use case 1, the commands you'll type are:
+
+| Command | When |
+|---|---|
+| `llms set <key>` | Adding a secret |
+| `llms profile exec <name> -- <cmd>` | **Daily use** |
+| `llms peek <key>` | "Did I store the right thing?" |
+| `llms list` | "What secrets do I have?" |
+| `llms delete <key>` | Removing a secret |
+
+No `session-start` needed. Sessions are auto-created on first read.
+
+---
+
+## Use Case 2: Delegating to an AI agent
+
+This is the headline. When an AI agent runs on your machine, it
+inherits your full identity — your `.env` files, your `~/.aws/credentials`,
+everything. `llms` lets you delegate a *narrow slice* instead.
+
+The primitive is a **macaroon**: a signed, time-bounded bearer token
+with caveats (secret, repo, branch, agent, TTL) enforced by an
+HMAC-SHA256 chain. The agent can use what you've given it. It cannot
+widen the grant. It cannot escalate.
+
+### Step 1: Start a session
+
+For delegation, you start a session explicitly. This is the conscious
+"I am delegating to an agent now" gesture.
+
+```bash
+llms session-start --ttl 8h       # workday-length session
+llms session-info                  # verify what's active
+```
+
+### Step 2: Mint a token
+
+**By hand (full control over every caveat):**
+
+```bash
+M=$(llms macaroon mint \
+    --secret db_password \
+    --ttl 5m \
+    --branch main \
+    --agent claude-code)
+```
+
+**Via profile (same thing, less typing):**
+
+```bash
+eval "$(llms profile mint deploy --ttl 5m)"
+# LLM_SECRETS_MACAROON is now in the shell environment
+```
+
+Both produce the same shaped macaroon. Profiles just save you retyping
+the caveat list.
+
+### Step 3: Hand it to the agent
+
+```bash
+# Via env var (the standard way)
+LLM_SECRETS_MACAROON=$M claude
+
+# Or one-shot exec
+LLM_SECRETS_MACAROON=$M llms exec --inject DB=db_password -- ./migrate.sh
+
+# Or via profile exec (mints + execs in one step)
+llms profile exec deploy -- ./deploy.sh
+```
+
+### Step 4: What the agent CAN'T do
+
+The token is cryptographically narrowed. The agent cannot:
+
+- **Read a secret not in the token** — `peek api_key` fails if the token only covers `db_password`.
+- **Extend the TTL** — removing or modifying the `expires_at` caveat invalidates the HMAC chain.
+- **Switch branches/repos** — `branch_eq` and `repo_eq` caveats are baked in.
+- **Mint its own tokens** — it doesn't have the root key.
+- **See plaintext on stdout** — there is no `get` command, not even an MCP tool that returns plaintext.
+
+### Step 5: Inspect and verify
+
+```bash
+# What does this token allow? (pure parse, never touches the store)
+llms macaroon inspect --macaroon "$M"
+
+# Is it valid right now, in this context?
+llms macaroon verify --macaroon "$M" --key db_password
+```
+
+### Step 6: Killswitch
+
+```bash
+llms revoke-all              # delete root key → every token dead in O(1)
+llms revoke-all --rotate     # also re-encrypt the store under a fresh age key
+```
+
+Your secrets are untouched. Only the macaroon chain dies. Start a new
+session and you're back in business.
+
+### The commands you'll type
+
+| Command | When |
+|---|---|
+| `llms session-start --ttl 8h` | Before a delegation session |
+| `llms macaroon mint ...` | One-off, ad-hoc delegation |
+| `eval "$(llms profile mint <name>)"` | Repeated delegation pattern |
+| `llms profile exec <name> -- <cmd>` | Mint + exec in one step |
+| `llms macaroon inspect --macaroon $M` | Debugging token issues |
+| `llms audit --last 20` | "What did the agent touch?" |
+| `llms revoke-all` | Something looks wrong |
+
+---
+
+## Policy file (optional)
+
+Drop `.llm-secrets-policy.yaml` at the git root of a repo to control
+which secrets are reachable by identity:
 
 ```yaml
 secrets:
@@ -81,95 +243,40 @@ secrets:
         branch: [main, develop]
         user: alice@acme.com
         agent: claude-code
-        max_ttl: 10m
     deny:
-      - branch: "*"  # everything else: denied
+      - branch: "*"
 ```
 
-Match semantics:
-
-- The policy is checked **on every read** (`peek`, `exec`, `lease`).
-- Missing fields in a rule match anything.
-- String fields can be a single value or a list (`branch: [main, develop]`).
-- `"*"` is a wildcard.
+- Checked on **every read** (`peek`, `exec`, `lease`).
+- Missing fields match anything. `"*"` is a wildcard.
 - `deny` rules short-circuit `allow`.
-- A key not mentioned in the policy is **denied** — explicit allow-list semantics.
-
-If no `.llm-secrets-policy.yaml` exists, behaviour is **permissive** (backwards compatible with unmanaged use).
+- Unmentioned keys are **denied** (explicit allow-list).
+- No policy file = permissive (backwards compatible).
 
 ## Leases and audit
 
-A **lease** records that a secret was granted to a session, with a TTL. It produces an audit trail.
-
 ```bash
-# Grant a 5-minute lease (requires an active session)
-llms lease db_password --ttl 5m
-
-# See active leases
-llms leases
-
-# Inspect the audit log
-llms audit
-llms audit --last 50
-llms audit --json
+llms lease db_password --ttl 5m     # time-bounded access grant
+llms leases                          # active leases
+llms audit                           # who/when/what for every read
+llms audit --last 50 --json          # raw JSONL
 ```
 
-The audit log is at `$LLM_SECRETS_DIR/audit.jsonl`, append-only, mode 0600.
-
-## Macaroons — delegating capability to an agent (v1.1+)
-
-A **macaroon** is a bearer token the dev mints to grant an agent narrow, time-bounded access to specific secrets. The agent inherits *less* than the dev's session, never more — it cannot escalate by removing caveats. See [ADR 0006](adr/0006-macaroons.md) for the full design.
-
-```bash
-# Mint: scoped to one secret, 5 minutes, only for Claude Code on this branch
-M=$(llms macaroon mint \
-    --secret db_password \
-    --ttl 5m \
-    --agent claude-code \
-    --branch main)
-
-# Inspect — pure parse, never touches the store
-echo "$M" | llms macaroon inspect
-
-# Verify against the current session context
-llms macaroon verify --macaroon "$M" --key db_password
-
-# Hand to an agent via env var, then run it
-export LLM_SECRETS_MACAROON="$M"
-claude
-
-# Or use it explicitly with one-shot exec
-llms exec --inject DB=db_password --macaroon "$M" -- ./run-migrations.sh
-```
-
-The agent never sees the macaroon root key. It cannot mint new macaroons. It cannot widen the one it holds. Every use is audited (`peek.macaroon` / `exec.inject.macaroon`).
-
-`revoke-all` deletes the root key, invalidating every derived macaroon in one shot.
-
-> **v1.1 status:** the wire format is *experimental* — treat tokens as ephemeral. We may break the format in v1.2 if real-world usage exposes a problem.
-
-## Killswitch
-
-```bash
-llms revoke-all
-```
-
-Deletes every active lease and the active session, and writes a `revoke.all` entry to the audit log. Use this when you suspect a session has been compromised. (`--rotate`, which also re-encrypts the store under a new age key, is planned for v1.x.)
+Audit log: `$LLM_SECRETS_DIR/audit.jsonl`, append-only, mode 0600.
 
 ## MCP server
 
-`llms mcp` runs a Model Context Protocol server on stdio for AI agents. The exposed tool surface is **deliberately a subset** of the CLI:
+`llms mcp` runs a Model Context Protocol server on stdio. The tool
+surface is deliberately a subset — **no MCP tool returns plaintext**:
 
-| MCP tool | What it does |
+| MCP tool | Description |
 |---|---|
-| `list_secrets` | Returns key names. |
-| `peek_secret` | Returns the **masked** preview. |
-| `audit_recent` | Read-only inspection of the audit log. |
-| `status` | Store health. |
+| `list_secrets` | Key names |
+| `peek_secret` | Masked preview |
+| `audit_recent` | Audit log entries |
+| `status` | Store health |
 
-There is no MCP tool that returns plaintext, by design. See [ADR 0005](adr/0005-mcp-server.md).
-
-To wire it into Claude Code, add to your MCP config:
+Wire into Claude Code:
 
 ```json
 {
@@ -182,12 +289,13 @@ To wire it into Claude Code, add to your MCP config:
 }
 ```
 
+See [ADR 0005](adr/0005-mcp-server.md).
+
 ## Status and troubleshooting
 
 ```bash
-llms status
+llms status        # store directory, identity, secret count
+llms --version     # confirm installed version
 ```
 
-Reports the store directory, whether `identity.txt` and `store.age` are present, and the secret count.
-
-If `cargo install llm-secrets` fails, check that your Rust toolchain is at least 1.75 (we use edition 2024 features).
+If `cargo install` fails, ensure Rust >= 1.85 (edition 2024).
