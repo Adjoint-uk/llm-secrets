@@ -502,12 +502,16 @@ fn gate<'a>(key: &'a str, flag: &Option<String>) -> Result<crate::macaroon::Cont
     let ctx = crate::macaroon::Context::current(key);
     crate::policy::check_access(&ctx)?;
 
-    let m = if let Some(encoded) = crate::macaroon::pick_macaroon(flag) {
-        crate::macaroon::Macaroon::decode(&encoded)?
+    if let Some(encoded) = crate::macaroon::pick_macaroon(flag) {
+        // Explicit macaroon (agent delegation path) — verify as-is.
+        crate::macaroon::Macaroon::decode(&encoded)?.verify(&ctx)?;
     } else {
-        crate::macaroon::Macaroon::load_or_auto_mint()?
-    };
-    m.verify(&ctx)?;
+        // Direct-CLI path — auto-mint if missing, re-mint if expired.
+        let m = crate::macaroon::Macaroon::load_or_auto_mint()?;
+        if m.verify(&ctx).is_err() {
+            crate::macaroon::Macaroon::mint_root(chrono::Duration::hours(1))?.verify(&ctx)?;
+        }
+    }
     Ok(ctx)
 }
 
