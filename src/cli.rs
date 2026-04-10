@@ -435,7 +435,7 @@ pub fn run() -> Result<()> {
     }
 }
 
-// ---- v0.2 command implementations -----------------------------------------
+// ---- command implementations ------------------------------------------------
 
 fn cmd_init() -> Result<()> {
     let (id_path, store_path) = store::init()?;
@@ -443,7 +443,11 @@ fn cmd_init() -> Result<()> {
     println!("  identity: {}", id_path.display());
     println!("  store:    {}", store_path.display());
     println!();
-    println!("back up your identity file. without it, the store cannot be decrypted.");
+    println!(
+        "IMPORTANT: copy {} to a safe backup location.",
+        id_path.display()
+    );
+    println!("This is your age secret key. Without it, the store cannot be decrypted.");
     Ok(())
 }
 

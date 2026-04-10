@@ -4,6 +4,35 @@ All notable changes to `llm-secrets` will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] — 2026-04-10
+
+**XDG-compliant store location.** The default store directory moves from `~/.llm-secrets/` to `~/.local/share/llm-secrets/` (XDG_DATA_HOME). Config stays at `~/.config/llm-secrets/` (profiles.toml). Both paths are now XDG-compliant.
+
+### Breaking changes
+
+- **Default store path**: `~/.llm-secrets/` → `~/.local/share/llm-secrets/`. Existing installs at the old path are detected automatically via fallback and continue to work without any action. New installs create at the XDG path. To migrate: `mv ~/.llm-secrets ~/.local/share/llm-secrets`. `$LLM_SECRETS_DIR` still overrides everything.
+
+### Changed
+
+- **`store_dir()` resolution**: checks `$LLM_SECRETS_DIR` → XDG path → legacy `~/.llm-secrets/` fallback.
+- **`llms init` message**: now explicitly says "copy [path] to a safe backup location" instead of the ambiguous "back up your identity file".
+- Stale `v0.2` section comments cleaned up in `cli.rs`.
+
+### Layout (v3.0)
+
+```
+~/.local/share/llm-secrets/   (XDG_DATA_HOME — the store)
+  identity.txt                 age secret key
+  store.age                    encrypted secret store
+  root.key                     HMAC root for macaroon chain
+  session.json                 current root macaroon
+  audit.jsonl                  access log
+  leases.json                  active leases
+
+~/.config/llm-secrets/        (XDG_CONFIG_HOME — config)
+  profiles.toml                profile recipes
+```
+
 ## [2.2.0] — 2026-04-10
 
 **Lazy auto-mint sessions.** Read operations (`peek`, `exec`, `lease`) no longer require an explicit `llms session-start` first. If no session exists on the direct-CLI path, a 1h session is silently auto-minted. Delegation commands (`macaroon mint`, `profile mint/exec`) still require an explicit session — that's the conscious "I'm delegating to an agent" gesture.

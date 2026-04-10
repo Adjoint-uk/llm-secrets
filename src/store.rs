@@ -24,17 +24,38 @@ const STORE_FILENAME: &str = "store.age";
 const IDENTITY_FILENAME: &str = "identity.txt";
 const STORE_DIR_ENV: &str = "LLM_SECRETS_DIR";
 
-/// Resolve the store directory. Honours `$LLM_SECRETS_DIR`, otherwise
-/// `~/.llm-secrets/`.
+/// Resolve the store directory.
+///
+/// Priority:
+/// 1. `$LLM_SECRETS_DIR` (explicit override, e.g. for tests)
+/// 2. `$XDG_DATA_HOME/llm-secrets` (default `~/.local/share/llm-secrets`)
+/// 3. `~/.llm-secrets` (legacy fallback — used if it exists and the XDG
+///    path does not, so existing installs keep working without migration)
 pub fn store_dir() -> Result<PathBuf> {
     if let Ok(custom) = std::env::var(STORE_DIR_ENV)
         && !custom.is_empty()
     {
         return Ok(PathBuf::from(custom));
     }
+
+    let xdg = dirs::data_dir()
+        .ok_or_else(|| Error::Other("could not determine data directory".into()))?
+        .join("llm-secrets");
+
     let home = dirs::home_dir()
         .ok_or_else(|| Error::Other("could not determine home directory".into()))?;
-    Ok(home.join(".llm-secrets"))
+    let legacy = home.join(".llm-secrets");
+
+    // XDG path exists → use it (new installs, or already migrated).
+    // XDG doesn't exist but legacy does → use legacy (existing installs).
+    // Neither exists → use XDG (new install will create it via `init`).
+    if xdg.exists() {
+        Ok(xdg)
+    } else if legacy.exists() {
+        Ok(legacy)
+    } else {
+        Ok(xdg)
+    }
 }
 
 pub fn identity_path() -> Result<PathBuf> {
