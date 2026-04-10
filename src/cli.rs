@@ -879,7 +879,7 @@ fn cmd_profile_mint(name: &str, ttl_override: Option<String>) -> Result<()> {
         .as_deref()
         .map(crate::macaroon::parse_duration)
         .transpose()?;
-    let root = crate::macaroon::Macaroon::load_root()?;
+    let root = crate::macaroon::Macaroon::load_or_auto_mint()?;
     let child = root.delegate(p.to_caveats(ttl))?;
     let encoded = child.encode()?;
     println!("export LLM_SECRETS_MACAROON={encoded}");
@@ -903,7 +903,7 @@ fn cmd_profile_exec(name: &str, ttl_override: Option<String>, command: Vec<Strin
         .as_deref()
         .map(crate::macaroon::parse_duration)
         .transpose()?;
-    let root = crate::macaroon::Macaroon::load_root()?;
+    let root = crate::macaroon::Macaroon::load_or_auto_mint()?;
     let child = root.delegate(p.to_caveats(ttl))?;
     let encoded = child.encode()?;
 
