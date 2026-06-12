@@ -92,12 +92,24 @@ impl LeaseSet {
         before - self.leases.len()
     }
 
-    #[allow(dead_code)] // used by `exec --leased` enforcement (planned)
     pub fn active_for(&self, key: &str) -> Option<&Lease> {
         self.leases
             .iter()
             .filter(|l| l.key == key && !l.is_expired())
             .max_by_key(|l| l.expires_at)
+    }
+
+    /// Strict-mode gate (`exec --leased`): the key must hold a current lease,
+    /// otherwise fail closed. An expired lease counts as no lease.
+    pub fn require_active(&self, key: &str) -> Result<()> {
+        if self.active_for(key).is_some() {
+            Ok(())
+        } else {
+            Err(Error::PolicyDenied {
+                key: key.to_string(),
+                reason: "strict mode (--leased): no active lease — run `llms lease <key> --ttl <dur>` first".to_string(),
+            })
+        }
     }
 }
 
@@ -276,5 +288,42 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(set.leases.len(), 1);
         assert_eq!(set.leases[0].key, "active");
+    }
+
+    #[test]
+    fn require_active_is_fail_closed() {
+        let now = Utc::now();
+        let held = LeaseSet {
+            leases: vec![Lease {
+                key: "live".into(),
+                granted_at: now,
+                expires_at: now + Duration::hours(1),
+                session_who: "u".into(),
+                session_repo: "r".into(),
+                session_agent: "a".into(),
+                session_pid: 1,
+            }],
+        };
+        // held + current -> allowed
+        assert!(held.require_active("live").is_ok());
+        // never leased -> denied (fail closed)
+        assert!(matches!(
+            held.require_active("missing"),
+            Err(crate::error::Error::PolicyDenied { .. })
+        ));
+
+        // an expired lease counts as no lease -> denied
+        let expired = LeaseSet {
+            leases: vec![Lease {
+                key: "live".into(),
+                granted_at: now - Duration::hours(2),
+                expires_at: now - Duration::seconds(1),
+                session_who: "u".into(),
+                session_repo: "r".into(),
+                session_agent: "a".into(),
+                session_pid: 1,
+            }],
+        };
+        assert!(expired.require_active("live").is_err());
     }
 }
