@@ -4,6 +4,12 @@ All notable changes to `llm-secrets` will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Strict-mode leases** (#15). `exec --leased` (also `exec --profile … --leased` and `profile exec … --leased`) now requires a current lease for every injected secret and **fails closed** if none is held. An expired lease counts as no lease. The default `exec` path is unchanged — strict mode is opt-in.
+
 ## [3.0.0] — 2026-04-10
 
 **XDG-compliant store location.** The default store directory moves from `~/.llm-secrets/` to `~/.local/share/llm-secrets/` (XDG_DATA_HOME). Config stays at `~/.config/llm-secrets/` (profiles.toml). Both paths are now XDG-compliant.

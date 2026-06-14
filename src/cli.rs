@@ -152,6 +152,10 @@ ENV=key mappings. Equivalent to `llms profile exec`.
         /// Present a macaroon (also honoured: $LLM_SECRETS_MACAROON)
         #[arg(long)]
         macaroon: Option<String>,
+        /// Strict mode: require a current lease for every injected secret,
+        /// failing closed if none is held (see `llms lease`).
+        #[arg(long)]
+        leased: bool,
         /// Command to run
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -325,6 +329,10 @@ enum ProfileCommand {
         /// Override the profile's default TTL
         #[arg(long)]
         ttl: Option<String>,
+        /// Strict mode: require a current lease for every injected secret,
+        /// failing closed if none is held (see `llms lease`).
+        #[arg(long)]
+        leased: bool,
         /// Command to run
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -393,17 +401,18 @@ pub fn run() -> Result<()> {
             profile,
             ttl,
             macaroon,
+            leased,
             command,
         } => {
             if let Some(name) = profile {
-                cmd_profile_exec(&name, ttl, command)
+                cmd_profile_exec(&name, ttl, command, leased)
             } else {
                 if inject.is_empty() {
                     return Err(Error::Other(
                         "exec requires --inject ENV=key (or --profile <name>)".into(),
                     ));
                 }
-                cmd_exec(inject, macaroon, command)
+                cmd_exec(inject, macaroon, command, leased)
             }
         }
         Command::Status => cmd_status(),
@@ -430,7 +439,12 @@ pub fn run() -> Result<()> {
             ProfileCommand::List => cmd_profile_list(),
             ProfileCommand::Show { name } => cmd_profile_show(&name),
             ProfileCommand::Mint { name, ttl } => cmd_profile_mint(&name, ttl),
-            ProfileCommand::Exec { name, ttl, command } => cmd_profile_exec(&name, ttl, command),
+            ProfileCommand::Exec {
+                name,
+                ttl,
+                leased,
+                command,
+            } => cmd_profile_exec(&name, ttl, command, leased),
         },
     }
 }
@@ -604,13 +618,26 @@ fn cmd_status() -> Result<()> {
     Ok(())
 }
 
-fn cmd_exec(inject: Vec<String>, macaroon: Option<String>, command: Vec<String>) -> Result<()> {
+fn cmd_exec(
+    inject: Vec<String>,
+    macaroon: Option<String>,
+    command: Vec<String>,
+    leased: bool,
+) -> Result<()> {
     if command.is_empty() {
         return Err(Error::Other("no command provided after `--`".into()));
     }
 
     let identity = store::load_identity()?;
     let store = store::load_store(&identity)?;
+
+    // Strict mode (#15): every injected secret must hold a current lease, or we
+    // fail closed before any plaintext is touched.
+    let leases = if leased {
+        Some(crate::lease::LeaseSet::load()?)
+    } else {
+        None
+    };
 
     let mut process = ProcessCommand::new(&command[0]);
     process.args(&command[1..]);
@@ -626,6 +653,9 @@ fn cmd_exec(inject: Vec<String>, macaroon: Option<String>, command: Vec<String>)
         let (env_var, secret_key) = spec
             .split_once('=')
             .ok_or_else(|| Error::Other(format!("invalid --inject {spec:?}, expected ENV=key")))?;
+        if let Some(leases) = &leases {
+            leases.require_active(secret_key)?;
+        }
         let ctx = gate(secret_key, &macaroon)?;
         let value = store
             .get(secret_key)
@@ -896,7 +926,12 @@ fn cmd_profile_mint(name: &str, ttl_override: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_profile_exec(name: &str, ttl_override: Option<String>, command: Vec<String>) -> Result<()> {
+fn cmd_profile_exec(
+    name: &str,
+    ttl_override: Option<String>,
+    command: Vec<String>,
+    leased: bool,
+) -> Result<()> {
     if command.is_empty() {
         return Err(Error::Other("no command provided after `--`".into()));
     }
@@ -928,7 +963,7 @@ fn cmd_profile_exec(name: &str, ttl_override: Option<String>, command: Vec<Strin
         Some(format!("profile={} command={}", p.name, command[0])),
     );
 
-    cmd_exec(inject, Some(encoded), command)
+    cmd_exec(inject, Some(encoded), command, leased)
 }
 
 /// Read a macaroon from `--macaroon`, or `LLM_SECRETS_MACAROON`, or stdin
