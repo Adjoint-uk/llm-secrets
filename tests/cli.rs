@@ -564,6 +564,38 @@ B = "b"
 }
 
 #[test]
+fn profile_show_warns_on_secret_missing_from_store() {
+    let dir = fresh_store();
+    let cfg = tempfile::tempdir().unwrap();
+    // store has "present" but not "absent"
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .args(["set", "present", "--stdin"])
+        .write_stdin("x")
+        .assert()
+        .success();
+    write_profiles(
+        cfg.path(),
+        r#"
+[demo]
+secrets = ["present", "absent"]
+ttl = "8h"
+"#,
+    );
+
+    llms()
+        .env("LLM_SECRETS_DIR", dir.path())
+        .env("LLM_SECRETS_CONFIG_DIR", cfg.path())
+        .args(["profile", "show", "demo"])
+        .assert()
+        .success() // a warning, never an error
+        .stdout(predicate::str::contains("profile:  demo"))
+        .stderr(predicate::str::contains("not in the store"))
+        .stderr(predicate::str::contains("absent"))
+        .stderr(predicate::str::contains("present").not());
+}
+
+#[test]
 fn profile_mint_then_use_via_env() {
     let dir = fresh_store();
     let cfg = tempfile::tempdir().unwrap();

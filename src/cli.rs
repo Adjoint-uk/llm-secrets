@@ -883,6 +883,29 @@ fn cmd_profile_list() -> Result<()> {
     Ok(())
 }
 
+/// Print a warning to stderr — yellow when stderr is a TTY and `NO_COLOR` is
+/// unset, plain otherwise (so pipes and CI stay clean).
+fn warn(msg: &str) {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+        eprintln!("\x1b[33mwarning:\x1b[0m {msg}");
+    } else {
+        eprintln!("warning: {msg}");
+    }
+}
+
+/// Referenced secrets that are absent per `exists`, deduped, in first-occurrence
+/// order. Pure helper so the cross-check logic is testable without a store.
+fn missing_from_store(referenced: &[String], exists: impl Fn(&str) -> bool) -> Vec<&str> {
+    let mut seen = std::collections::BTreeSet::new();
+    referenced
+        .iter()
+        .map(String::as_str)
+        .filter(|k| seen.insert(*k))
+        .filter(|k| !exists(k))
+        .collect()
+}
+
 fn cmd_profile_show(name: &str) -> Result<()> {
     let p = crate::profile::Profile::load(name)?;
     println!("profile:  {}", p.name);
@@ -907,6 +930,23 @@ fn cmd_profile_show(name: &str) -> Result<()> {
         println!("caveats:  (none beyond secrets+ttl)");
     } else {
         println!("caveats:  {}", extras.join(", "));
+    }
+
+    // #16: cross-check that every referenced secret exists in the live store.
+    // A warning, never an error — `show` must work even without a store.
+    match store::load_identity().and_then(|id| store::load_store(&id)) {
+        Ok(store) => {
+            let missing = missing_from_store(&p.secrets, |k| store.contains(k));
+            if !missing.is_empty() {
+                warn(&format!(
+                    "profile '{}' references secrets not in the store: {}",
+                    p.name,
+                    missing.join(", ")
+                ));
+            }
+        }
+        Err(Error::StoreNotFound) => {} // no store yet — nothing to verify against
+        Err(e) => warn(&format!("could not read store to verify secrets: {e}")),
     }
     Ok(())
 }
@@ -984,4 +1024,31 @@ fn read_macaroon_input(flag: Option<String>) -> Result<String> {
         ));
     }
     Ok(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_from_store_reports_only_absent_deduped() {
+        let referenced = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(), // duplicate
+            "c".to_string(),
+        ];
+        // only "a" and "c" exist in the store
+        let present = |k: &str| matches!(k, "a" | "c");
+        assert_eq!(missing_from_store(&referenced, present), vec!["b"]);
+
+        // everything present -> nothing missing
+        assert!(missing_from_store(&referenced, |_| true).is_empty());
+
+        // nothing present -> all reported once, in first-occurrence order
+        assert_eq!(
+            missing_from_store(&referenced, |_| false),
+            vec!["a", "b", "c"]
+        );
+    }
 }
