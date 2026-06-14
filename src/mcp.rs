@@ -208,7 +208,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value> {
             let value = st
                 .get(key)
                 .ok_or_else(|| crate::error::Error::KeyNotFound(key.to_string()))?;
-            let _ = lease::audit("mcp.peek", &ctx, None);
+            lease::record("mcp.peek", &ctx, None)?;
             Ok(text_result(store::mask(value, chars)))
         }
 
