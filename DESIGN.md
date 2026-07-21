@@ -50,21 +50,6 @@ local trust mechanism + vendor OIDC as a caveat type + TPM as a high-assurance
 opt-in*. Macaroons came first because they're the only one shippable without
 waiting on anyone else.
 
-## Competitive landscape
-
-**Amazon Bedrock AgentCore Identity** (introduced April 2026, extended with
-"bring your own secret" via Secrets Manager in June 2026) validates the core
-thesis — attestation-based workload identity gating policy-scoped credential
-access for AI agents — at enterprise scale. It is not a direct competitor:
-AgentCore Identity is scoped to agents running as hosted Bedrock/AWS workloads
-calling external APIs (CRM, Slack, GitHub) via OAuth Credential Providers.
-`llms` is scoped to the human's local dev machine — a terminal coding agent
-(Claude Code, Cursor) getting session-scoped macaroon leases per repo/branch/
-agent-type, no cloud dependency, no AWS account required. Worth tracking
-because AWS's arrival sets the vocabulary enterprises will expect ("Credential
-Provider" for what `llms` calls a caveat/lease) and is a leading indicator that
-vendor OIDC issuance (see above) is coming from the hyperscalers first.
-
 ## House rules
 
 - One logical change per PR.
