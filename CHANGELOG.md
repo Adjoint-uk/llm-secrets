@@ -11,6 +11,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Strict-mode leases** (#15). `exec --leased` (also `exec --profile … --leased` and `profile exec … --leased`) now requires a current lease for every injected secret and **fails closed** if none is held. An expired lease counts as no lease. The default `exec` path is unchanged — strict mode is opt-in.
 - **`profile show` cross-checks the store** (#16). `profile show` now warns (yellow on a TTY, plain otherwise) when a profile references a secret that does not exist in the live store. It stays a warning, never an error, so `show` still works without a store.
 - **Opt-in fail-closed audit** (#26, ADR 0010). Set `LLM_SECRETS_AUDIT_STRICT=1` to make a failed audit write on the secret-access path fail the operation closed. The default is unchanged (best-effort/fail-open, now with a stderr warning on failure).
+- **Glob support in the `repo` caveat matcher** (#22, ADR 0008 Phase 2). `repo = "adjoint/*"` in a profile (or `RepoEq` on a minted macaroon) now matches any repo starting with `adjoint/`. Exact-match patterns (no `*`) are unchanged.
 
 ## [3.0.0] — 2026-04-10
 

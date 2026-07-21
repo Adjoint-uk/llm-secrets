@@ -172,7 +172,7 @@ impl Caveat {
                     Err(format!("expires_at: token expired at {}", t.to_rfc3339()))
                 }
             }
-            Caveat::RepoEq(r) => eq_or_err("repo", &ctx.repo, r),
+            Caveat::RepoEq(r) => glob_or_err("repo", &ctx.repo, r),
             Caveat::BranchEq(b) => eq_or_err("branch", &ctx.branch, b),
             Caveat::AgentEq(a) => eq_or_err("agent", &ctx.agent, a),
             Caveat::WhoEq(w) => eq_or_err("who", &ctx.who, w),
@@ -194,6 +194,7 @@ impl Caveat {
             Caveat::SecretEq(s) => format!("secret == {s}"),
             Caveat::SecretsIn(list) => format!("secret in {list:?}"),
             Caveat::ExpiresAt(t) => format!("expires at {}", t.to_rfc3339()),
+            Caveat::RepoEq(r) if r.contains('*') => format!("repo ~ {r}"),
             Caveat::RepoEq(r) => format!("repo == {r}"),
             Caveat::BranchEq(b) => format!("branch == {b}"),
             Caveat::AgentEq(a) => format!("agent == {a}"),
@@ -208,6 +209,52 @@ fn eq_or_err(field: &str, actual: &str, expected: &str) -> std::result::Result<(
     } else {
         Err(format!("{field}_eq: '{actual}' != '{expected}'"))
     }
+}
+
+/// Exact match, or glob match if `pattern` contains `*` (e.g. `adjoint/*`).
+/// Used by `RepoEq` — Phase 2 of ADR 0008 (#22).
+fn glob_or_err(field: &str, actual: &str, pattern: &str) -> std::result::Result<(), String> {
+    if glob_match(pattern, actual) {
+        Ok(())
+    } else if pattern.contains('*') {
+        Err(format!(
+            "{field}_glob: '{actual}' does not match '{pattern}'"
+        ))
+    } else {
+        Err(format!("{field}_eq: '{actual}' != '{pattern}'"))
+    }
+}
+
+/// Minimal glob: `*` matches any sequence (including empty); every other
+/// character matches literally. No `?`, character classes, or escaping —
+/// the repo matcher only ever needs `owner/*` style prefixes.
+fn glob_match(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut pos = 0usize;
+    let last = parts.len() - 1;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !value[pos..].starts_with(part) {
+                return false;
+            }
+            pos += part.len();
+        } else if i == last {
+            if !value[pos..].ends_with(part) {
+                return false;
+            }
+        } else if let Some(found) = value[pos..].find(part) {
+            pos += found + part.len();
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 fn sort_value(v: serde_json::Value) -> serde_json::Value {
@@ -530,6 +577,44 @@ mod tests {
                 .check(&ctx_for("x"))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn repo_eq_exact_match_unchanged() {
+        assert!(
+            Caveat::RepoEq("acme/billing".into())
+                .check(&ctx_for("x"))
+                .is_ok()
+        );
+        assert!(
+            Caveat::RepoEq("acme/other".into())
+                .check(&ctx_for("x"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn repo_eq_glob_matches_owner_prefix() {
+        assert!(Caveat::RepoEq("acme/*".into()).check(&ctx_for("x")).is_ok());
+        assert!(
+            Caveat::RepoEq("other/*".into())
+                .check(&ctx_for("x"))
+                .is_err()
+        );
+        assert!(Caveat::RepoEq("*".into()).check(&ctx_for("x")).is_ok());
+    }
+
+    #[test]
+    fn glob_match_cases() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("acme/*", "acme/billing"));
+        assert!(!glob_match("acme/*", "other/billing"));
+        assert!(glob_match("*/billing", "acme/billing"));
+        assert!(glob_match("a*c", "abc"));
+        assert!(glob_match("a*c", "ac"));
+        assert!(!glob_match("a*c", "abd"));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("exact", "other"));
     }
 
     #[test]
