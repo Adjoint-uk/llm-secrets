@@ -151,9 +151,40 @@ pub struct AuditEntry {
     pub note: Option<String>,
 }
 
-/// Append a single audit record. Best-effort: if the file cannot be opened
-/// for append we still return Err so callers can decide whether to fail
-/// the operation. (Default: yes — auditability is load-bearing.)
+/// `true` when strict (fail-closed) auditing is requested via
+/// `LLM_SECRETS_AUDIT_STRICT` (`1` or `true`). See ADR 0010.
+pub fn audit_strict() -> bool {
+    std::env::var("LLM_SECRETS_AUDIT_STRICT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Apply the ADR 0010 audit-durability policy to an audit result: in strict
+/// mode an audit-write failure propagates (fail closed); otherwise it is
+/// swallowed with a stderr warning (fail open, the default).
+fn apply_audit_policy(strict: bool, result: Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if strict => Err(e),
+        Err(e) => {
+            eprintln!("warning: audit write failed (continuing): {e}");
+            Ok(())
+        }
+    }
+}
+
+/// Record an audit entry on the secret-access path, honouring the ADR 0010
+/// policy: fail-open by default, fail-closed under `LLM_SECRETS_AUDIT_STRICT`.
+/// Prefer this over calling [`audit`] directly from access paths.
+pub fn record(event: &str, ctx: &Context, note: Option<String>) -> Result<()> {
+    apply_audit_policy(audit_strict(), audit(event, ctx, note))
+}
+
+/// Append a single audit record. Returns `Err` if the entry cannot be written.
+///
+/// By default the secret-access path is fail-**open**: callers route through
+/// [`record`], which swallows the error (with a warning) unless
+/// `LLM_SECRETS_AUDIT_STRICT` is set. See ADR 0010.
 pub fn audit(event: &str, ctx: &Context, note: Option<String>) -> Result<()> {
     let path = audit_path()?;
     let parent = path
@@ -325,5 +356,17 @@ mod tests {
             }],
         };
         assert!(expired.require_active("live").is_err());
+    }
+
+    #[test]
+    fn audit_policy_fails_closed_only_in_strict_mode() {
+        let err = || Err(crate::error::Error::Other("disk full".into()));
+        // success always passes through
+        assert!(apply_audit_policy(false, Ok(())).is_ok());
+        assert!(apply_audit_policy(true, Ok(())).is_ok());
+        // default (fail-open): an audit error is swallowed
+        assert!(apply_audit_policy(false, err()).is_ok());
+        // strict (fail-closed): the error propagates
+        assert!(apply_audit_policy(true, err()).is_err());
     }
 }

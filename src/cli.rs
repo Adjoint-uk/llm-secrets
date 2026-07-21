@@ -661,7 +661,7 @@ fn cmd_exec(
             .get(secret_key)
             .ok_or_else(|| Error::KeyNotFound(secret_key.to_string()))?;
         process.env(env_var, value);
-        let _ = crate::lease::audit(event, &ctx, None);
+        crate::lease::record(event, &ctx, None)?;
     }
 
     // Drop the decrypted store before exec'ing the child so plaintext lives
