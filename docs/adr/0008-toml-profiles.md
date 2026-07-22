@@ -225,7 +225,8 @@ These are mentioned for context only. Each will get its own ADR if and when need
 
 - `profiles.d/<name>.toml` directory layout for per-machine overrides
 - `EnvMap` caveat for fully self-contained portable profiles (cross-machine delegation)
-- Glob support in `repo` matcher (`adjoint/*`) — Phase 1 is exact match only
+- ~~Glob support in `repo` matcher (`adjoint/*`) — Phase 1 is exact match only~~
+  **Shipped** — see `glob_match` in `src/macaroon.rs` (#22)
 - Hierarchical profiles / inheritance (`iba-prod extends iba`)
 - Auto-cache of recently-minted macaroons to avoid re-mint cost on hot paths
 - Maximum-TTL enforcement as a session policy
