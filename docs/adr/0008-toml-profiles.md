@@ -223,7 +223,11 @@ The `command` field captures `argv[0]` only — never arguments, which may conta
 
 These are mentioned for context only. Each will get its own ADR if and when needed.
 
-- `profiles.d/<name>.toml` directory layout for per-machine overrides
+- ~~`profiles.d/<name>.toml` directory layout for per-machine overrides~~
+  **Shipped** — see `read_profiles_file()` in `src/profile.rs` (#21). Unlike
+  `extends`, this is a config-precedence question, not a security boundary:
+  a name defined in `profiles.d/*.toml` fully replaces the same-named entry
+  from `profiles.toml`, no narrowing constraint.
 - `EnvMap` caveat for fully self-contained portable profiles (cross-machine delegation)
 - ~~Glob support in `repo` matcher (`adjoint/*`) — Phase 1 is exact match only~~
   **Shipped** — see `glob_match` in `src/macaroon.rs` (#22)

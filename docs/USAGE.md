@@ -128,6 +128,12 @@ profile can narrow what it inherits (fewer secrets, shorter ttl, an
 extra `repo`/`branch`/`agent` restriction) but can never widen or
 override something the parent already restricts.
 
+For per-machine differences (not dotfile-synced), drop override files in
+`~/.config/llm-secrets/profiles.d/*.toml`. Any profile name defined there
+fully replaces the same-named entry from `profiles.toml` — this is a
+config-precedence question, not a security boundary, so there's no
+narrowing rule here (unlike `extends`).
+
 ### That's it
 
 For use case 1, the commands you'll type are:

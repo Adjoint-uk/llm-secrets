@@ -12,10 +12,19 @@
 //! `~/.config/llm-secrets/profiles.toml`). The store at `~/.llm-secrets/`
 //! is the security boundary; profiles.toml is non-secret config — diffable,
 //! vimmable, dotfile-managed. Stealing it confers no authority.
+//!
+//! An optional `profiles.d/*.toml` directory next to `profiles.toml` holds
+//! per-machine overrides (not synced by dotfiles): each file is a map of
+//! `name -> profile`, same shape as `profiles.toml`, and any name it
+//! defines fully replaces the same-named entry from `profiles.toml` (or
+//! adds a new machine-local profile if the name doesn't exist there). This
+//! is a config-loading precedence question, not a security boundary, so —
+//! unlike `extends` — there is no narrowing constraint: the override simply
+//! wins. See `docs/adr/0008-toml-profiles.md`, Phase 2.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Duration;
 use serde::Deserialize;
@@ -24,6 +33,7 @@ use crate::error::{Error, Result};
 use crate::macaroon::{Caveat, parse_duration};
 
 const PROFILES_FILENAME: &str = "profiles.toml";
+const PROFILES_D_DIRNAME: &str = "profiles.d";
 const CONFIG_DIR_ENV: &str = "LLM_SECRETS_CONFIG_DIR";
 
 /// Resolve the config directory. Honours `$LLM_SECRETS_CONFIG_DIR`,
@@ -42,6 +52,10 @@ pub fn config_dir() -> Result<PathBuf> {
 
 pub fn profiles_path() -> Result<PathBuf> {
     Ok(config_dir()?.join(PROFILES_FILENAME))
+}
+
+pub fn profiles_d_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join(PROFILES_D_DIRNAME))
 }
 
 /// In-memory representation of one profile, ready to be turned into caveats.
@@ -84,17 +98,60 @@ struct ProfileToml {
     agent: Option<String>,
 }
 
+fn parse_profiles_toml(path: &Path, text: &str) -> Result<BTreeMap<String, ProfileToml>> {
+    toml::from_str(text).map_err(|e| Error::Other(format!("{} invalid: {e}", path.display())))
+}
+
+/// Reads `profiles.toml`, then layers any `profiles.d/*.toml` overrides on
+/// top (sorted by filename for determinism). A name defined in `profiles.d`
+/// fully replaces the same-named entry from `profiles.toml` — that's the
+/// point (per-machine override) — but the same name appearing in two
+/// different `profiles.d` files is almost certainly a mistake, so that's
+/// rejected loudly rather than silently picked by sort order.
 fn read_profiles_file() -> Result<BTreeMap<String, ProfileToml>> {
     let path = profiles_path()?;
-    if !path.exists() {
+    let file_exists = path.exists();
+    let mut map: BTreeMap<String, ProfileToml> = if file_exists {
+        let text = fs::read_to_string(&path)?;
+        parse_profiles_toml(&path, &text)?
+    } else {
+        BTreeMap::new()
+    };
+
+    let d_dir = profiles_d_dir()?;
+    let mut had_d_files = false;
+    if d_dir.is_dir() {
+        let mut entries: Vec<PathBuf> = fs::read_dir(&d_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .collect();
+        entries.sort();
+        had_d_files = !entries.is_empty();
+
+        let mut override_sources: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for file_path in entries {
+            let text = fs::read_to_string(&file_path)?;
+            let overrides = parse_profiles_toml(&file_path, &text)?;
+            for (name, t) in overrides {
+                if let Some(prev) = override_sources.insert(name.clone(), file_path.clone()) {
+                    return Err(Error::Other(format!(
+                        "profile '{name}' is defined in multiple profiles.d files: {} and {}",
+                        prev.display(),
+                        file_path.display()
+                    )));
+                }
+                map.insert(name, t);
+            }
+        }
+    }
+
+    if !file_exists && !had_d_files {
         return Err(Error::Other(format!(
             "no profiles file at {} — create one to use profiles",
             path.display()
         )));
     }
-    let text = fs::read_to_string(&path)?;
-    let map: BTreeMap<String, ProfileToml> =
-        toml::from_str(&text).map_err(|e| Error::Other(format!("profiles.toml invalid: {e}")))?;
     Ok(map)
 }
 
@@ -526,6 +583,91 @@ ttl = "1h"
         );
         let err = Profile::load("a").unwrap_err().to_string();
         assert!(err.contains("inheritance cycle"), "{err}");
+
+        // profiles.d: fully overrides a same-named entry from profiles.toml
+        let d_dir = dir.path().join("profiles.d");
+        let write_d = |filename: &str, body: &str| {
+            std::fs::create_dir_all(&d_dir).unwrap();
+            std::fs::write(d_dir.join(filename), body).unwrap();
+        };
+        std::fs::remove_dir_all(&d_dir).ok(); // clean slate between scenarios below
+        write(
+            r#"
+[iba]
+secrets = ["a", "b"]
+ttl = "8h"
+"#,
+        );
+        write_d(
+            "local.toml",
+            r#"
+[iba]
+secrets = ["z"]
+ttl = "30m"
+"#,
+        );
+        let p = Profile::load("iba").unwrap();
+        assert_eq!(p.secrets, vec!["z"]); // profiles.d wins, not merged field-by-field
+        assert_eq!(p.ttl, Duration::minutes(30));
+
+        // profiles.d: adds a profile that doesn't exist in profiles.toml at all
+        write_d(
+            "local.toml",
+            r#"
+[iba]
+secrets = ["z"]
+ttl = "30m"
+
+[homelab]
+secrets = ["a"]
+ttl = "1h"
+"#,
+        );
+        let p = Profile::load("homelab").unwrap();
+        assert_eq!(p.secrets, vec!["a"]);
+
+        // profiles.d: same name defined in two different files is rejected
+        std::fs::remove_dir_all(&d_dir).ok();
+        write_d(
+            "a.toml",
+            r#"
+[iba]
+secrets = ["a"]
+ttl = "1h"
+"#,
+        );
+        write_d(
+            "b.toml",
+            r#"
+[iba]
+secrets = ["b"]
+ttl = "1h"
+"#,
+        );
+        let err = Profile::load("iba").unwrap_err().to_string();
+        assert!(
+            err.contains("defined in multiple profiles.d files"),
+            "{err}"
+        );
+
+        // profiles.d alone (no profiles.toml) is sufficient
+        std::fs::remove_dir_all(&d_dir).ok();
+        std::fs::remove_file(dir.path().join("profiles.toml")).ok();
+        write_d(
+            "local.toml",
+            r#"
+[solo]
+secrets = ["a"]
+ttl = "1h"
+"#,
+        );
+        let p = Profile::load("solo").unwrap();
+        assert_eq!(p.secrets, vec!["a"]);
+
+        // Neither profiles.toml nor profiles.d present: still a clear error
+        std::fs::remove_dir_all(&d_dir).ok();
+        let err = Profile::load("solo").unwrap_err().to_string();
+        assert!(err.contains("no profiles file"), "{err}");
 
         unsafe {
             match prev {
