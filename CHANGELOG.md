@@ -4,7 +4,9 @@ All notable changes to `llm-secrets` will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.1.0] — 2026-07-22
+
+**Strict-mode & hygiene.** Fail-closed options for both secret injection and audit logging, better profile diagnostics, and glob-based repo scoping.
 
 ### Added
 
@@ -12,6 +14,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **`profile show` cross-checks the store** (#16). `profile show` now warns (yellow on a TTY, plain otherwise) when a profile references a secret that does not exist in the live store. It stays a warning, never an error, so `show` still works without a store.
 - **Opt-in fail-closed audit** (#26, ADR 0010). Set `LLM_SECRETS_AUDIT_STRICT=1` to make a failed audit write on the secret-access path fail the operation closed. The default is unchanged (best-effort/fail-open, now with a stderr warning on failure).
 - **Glob support in the `repo` caveat matcher** (#22, ADR 0008 Phase 2). `repo = "adjoint/*"` in a profile (or `RepoEq` on a minted macaroon) now matches any repo starting with `adjoint/`. Exact-match patterns (no `*`) are unchanged.
+- **MSRV declared**: `rust-version = "1.85"` in `Cargo.toml`, matching the edition 2024 floor.
 
 ## [3.0.0] — 2026-04-10
 
