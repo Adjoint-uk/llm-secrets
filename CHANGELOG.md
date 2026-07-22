@@ -4,6 +4,12 @@ All notable changes to `llm-secrets` will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Profile inheritance — `extends`** (#20, ADR 0008 Phase 2). A profile can `extends = "parent"` to inherit its `secrets`, `env`, `ttl`, and `repo`/`branch`/`agent` caveats. Additive-only: `secrets` may narrow to a subset of the parent's, `ttl` may shorten but never lengthen, and `repo`/`branch`/`agent` may only be set by the child if the parent left them unset — never overridden. Cycles and unknown parents are rejected at load time.
+
 ## [3.1.0] — 2026-07-22
 
 **Strict-mode & hygiene.** Fail-closed options for both secret injection and audit logging, better profile diagnostics, and glob-based repo scoping.

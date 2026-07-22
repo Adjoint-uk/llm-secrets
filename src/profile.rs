@@ -60,10 +60,22 @@ pub struct Profile {
 
 #[derive(Debug, Deserialize)]
 struct ProfileToml {
-    secrets: Vec<String>,
+    /// Parent profile name. When set, `secrets`/`ttl` become optional
+    /// (inherited from the parent if omitted) and every field this profile
+    /// does specify may only narrow what the parent already grants — never
+    /// widen it. See `resolve()`.
+    #[serde(default)]
+    extends: Option<String>,
+    /// Required unless `extends` is set (in which case it defaults to the
+    /// parent's list, or may be a subset of it).
+    #[serde(default)]
+    secrets: Option<Vec<String>>,
     #[serde(default)]
     env: BTreeMap<String, String>,
-    ttl: String,
+    /// Required unless `extends` is set (in which case it defaults to the
+    /// parent's ttl, or may be shorter than it).
+    #[serde(default)]
+    ttl: Option<String>,
     #[serde(default)]
     repo: Option<String>,
     #[serde(default)]
@@ -86,41 +98,170 @@ fn read_profiles_file() -> Result<BTreeMap<String, ProfileToml>> {
     Ok(map)
 }
 
-fn from_toml(name: String, t: ProfileToml) -> Result<Profile> {
-    let ttl = parse_duration(&t.ttl).map_err(|_| {
+fn parse_ttl(name: &str, s: &str) -> Result<Duration> {
+    parse_duration(s).map_err(|_| {
         Error::Other(format!(
-            "profile '{}' has invalid ttl '{}' (expected duration like '8h', '30m', '1d')",
-            name, t.ttl
+            "profile '{name}' has invalid ttl '{s}' (expected duration like '8h', '30m', '1d')"
+        ))
+    })
+}
+
+/// Resolve `name` to a fully-materialised `Profile`, following `extends`
+/// chains. `chain` tracks names currently being resolved (for cycle
+/// detection) — callers pass an empty `Vec`.
+///
+/// Inheritance is additive-only, mirroring the macaroon rule that a
+/// derived token can never widen what its parent grants (see
+/// `docs/adr/0008-toml-profiles.md`, Phase 2):
+/// - `secrets`, if given, must be a subset of the parent's.
+/// - `ttl`, if given, must not exceed the parent's.
+/// - `repo`/`branch`/`agent` may only be set by the child if the parent
+///   left them unset — a child can never override an inherited caveat.
+/// - `env` is pure CLI sugar (not a caveat), so the child's entries are
+///   simply merged on top of the parent's.
+fn resolve(
+    name: &str,
+    map: &BTreeMap<String, ProfileToml>,
+    chain: &mut Vec<String>,
+) -> Result<Profile> {
+    if chain.iter().any(|n| n == name) {
+        let mut cyc = chain.clone();
+        cyc.push(name.to_string());
+        return Err(Error::Other(format!(
+            "profile inheritance cycle: {}",
+            cyc.join(" -> ")
+        )));
+    }
+    chain.push(name.to_string());
+    let out = resolve_one(name, map, chain);
+    chain.pop();
+    out
+}
+
+fn resolve_one(
+    name: &str,
+    map: &BTreeMap<String, ProfileToml>,
+    chain: &mut Vec<String>,
+) -> Result<Profile> {
+    let t = map.get(name).ok_or_else(|| {
+        Error::Other(format!(
+            "profile '{name}' not found in {}",
+            profiles_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
         ))
     })?;
-    let p = Profile {
-        name,
-        secrets: t.secrets,
-        env: t.env,
-        ttl,
-        repo: t.repo,
-        branch: t.branch,
-        agent: t.agent,
+
+    let profile = if let Some(parent_name) = &t.extends {
+        if !map.contains_key(parent_name) {
+            return Err(Error::Other(format!(
+                "profile '{name}' extends unknown profile '{parent_name}'"
+            )));
+        }
+        let parent = resolve(parent_name, map, chain)?;
+
+        let secrets = match &t.secrets {
+            Some(list) => {
+                for s in list {
+                    if !parent.secrets.contains(s) {
+                        return Err(Error::Other(format!(
+                            "profile '{name}' extends '{parent_name}' but secret '{s}' is not in the parent's secrets list — inheritance can only narrow, never widen"
+                        )));
+                    }
+                }
+                list.clone()
+            }
+            None => parent.secrets.clone(),
+        };
+
+        let ttl = match &t.ttl {
+            Some(s) => {
+                let d = parse_ttl(name, s)?;
+                if d > parent.ttl {
+                    return Err(Error::Other(format!(
+                        "profile '{name}' extends '{parent_name}' but ttl '{s}' exceeds the parent's ttl ({}) — inheritance can only narrow, never widen",
+                        format_duration(parent.ttl)
+                    )));
+                }
+                d
+            }
+            None => parent.ttl,
+        };
+
+        let repo = narrow_field(name, parent_name, "repo", &parent.repo, &t.repo)?;
+        let branch = narrow_field(name, parent_name, "branch", &parent.branch, &t.branch)?;
+        let agent = narrow_field(name, parent_name, "agent", &parent.agent, &t.agent)?;
+
+        let mut env = parent.env.clone();
+        env.extend(t.env.clone());
+
+        Profile {
+            name: name.to_string(),
+            secrets,
+            env,
+            ttl,
+            repo,
+            branch,
+            agent,
+        }
+    } else {
+        let secrets = t.secrets.clone().ok_or_else(|| {
+            Error::Other(format!(
+                "profile '{name}' has no 'secrets' (required unless it uses 'extends')"
+            ))
+        })?;
+        let ttl_str = t.ttl.as_deref().ok_or_else(|| {
+            Error::Other(format!(
+                "profile '{name}' has no 'ttl' (required unless it uses 'extends')"
+            ))
+        })?;
+        let ttl = parse_ttl(name, ttl_str)?;
+        Profile {
+            name: name.to_string(),
+            secrets,
+            env: t.env.clone(),
+            ttl,
+            repo: t.repo.clone(),
+            branch: t.branch.clone(),
+            agent: t.agent.clone(),
+        }
     };
-    p.validate()?;
-    Ok(p)
+
+    profile.validate()?;
+    Ok(profile)
+}
+
+/// A child may only set a caveat field the parent left unset — never
+/// override one the parent already restricts to. Returns the resolved
+/// value (inherited, newly added, or unset).
+fn narrow_field(
+    name: &str,
+    parent_name: &str,
+    field: &str,
+    parent_value: &Option<String>,
+    child_value: &Option<String>,
+) -> Result<Option<String>> {
+    match (parent_value, child_value) {
+        (Some(_), Some(_)) => Err(Error::Other(format!(
+            "profile '{name}' extends '{parent_name}' but overrides the inherited '{field}' caveat — inheritance can only add new caveats, not change existing ones"
+        ))),
+        (Some(p), None) => Ok(Some(p.clone())),
+        (None, Some(c)) => Ok(Some(c.clone())),
+        (None, None) => Ok(None),
+    }
 }
 
 impl Profile {
     pub fn load(name: &str) -> Result<Self> {
-        let mut map = read_profiles_file()?;
-        let path_disp = profiles_path()?.display().to_string();
-        let t = map
-            .remove(name)
-            .ok_or_else(|| Error::Other(format!("profile '{name}' not found in {path_disp}")))?;
-        from_toml(name.to_string(), t)
+        let map = read_profiles_file()?;
+        resolve(name, &map, &mut Vec::new())
     }
 
     pub fn list() -> Result<Vec<Profile>> {
         let map = read_profiles_file()?;
         let mut out = Vec::with_capacity(map.len());
-        for (name, t) in map {
-            out.push(from_toml(name, t)?);
+        for name in map.keys() {
+            out.push(resolve(name, &map, &mut Vec::new())?);
         }
         Ok(out)
     }
@@ -256,6 +397,135 @@ B = "missing"
         let err = Profile::load("iba").unwrap_err().to_string();
         assert!(err.contains("missing"), "{err}");
         assert!(err.contains("not in the profile"), "{err}");
+
+        // extends: inherits secrets/ttl/env when the child omits them
+        write(
+            r#"
+[iba]
+secrets = ["a", "b", "c"]
+ttl = "8h"
+branch = "main"
+
+[iba.env]
+A = "a"
+
+[iba-prod]
+extends = "iba"
+
+[iba-prod.env]
+B = "b"
+"#,
+        );
+        let p = Profile::load("iba-prod").unwrap();
+        assert_eq!(p.secrets, vec!["a", "b", "c"]);
+        assert_eq!(p.ttl, Duration::hours(8));
+        assert_eq!(p.branch.as_deref(), Some("main"));
+        assert_eq!(p.env.get("A").unwrap(), "a"); // inherited
+        assert_eq!(p.env.get("B").unwrap(), "b"); // added
+
+        // extends: child may narrow secrets to a subset
+        write(
+            r#"
+[iba]
+secrets = ["a", "b", "c"]
+ttl = "8h"
+
+[iba-prod]
+extends = "iba"
+secrets = ["a", "b"]
+"#,
+        );
+        let p = Profile::load("iba-prod").unwrap();
+        assert_eq!(p.secrets, vec!["a", "b"]);
+
+        // extends: child cannot widen secrets beyond the parent's list
+        write(
+            r#"
+[iba]
+secrets = ["a"]
+ttl = "8h"
+
+[iba-prod]
+extends = "iba"
+secrets = ["a", "z"]
+"#,
+        );
+        let err = Profile::load("iba-prod").unwrap_err().to_string();
+        assert!(err.contains("'z'"), "{err}");
+        assert!(err.contains("never widen"), "{err}");
+
+        // extends: child may shorten ttl, but not lengthen it
+        write(
+            r#"
+[iba]
+secrets = ["a"]
+ttl = "8h"
+
+[iba-prod]
+extends = "iba"
+ttl = "1h"
+
+[iba-staging]
+extends = "iba"
+ttl = "1d"
+"#,
+        );
+        assert_eq!(Profile::load("iba-prod").unwrap().ttl, Duration::hours(1));
+        let err = Profile::load("iba-staging").unwrap_err().to_string();
+        assert!(err.contains("exceeds the parent's ttl"), "{err}");
+
+        // extends: child may add a caveat the parent left unset, but cannot
+        // override one the parent already set
+        write(
+            r#"
+[iba]
+secrets = ["a"]
+ttl = "8h"
+
+[iba-prod]
+extends = "iba"
+branch = "main"
+
+[iba-locked]
+extends = "iba-prod"
+branch = "dev"
+"#,
+        );
+        assert_eq!(
+            Profile::load("iba-prod").unwrap().branch.as_deref(),
+            Some("main")
+        );
+        let err = Profile::load("iba-locked").unwrap_err().to_string();
+        assert!(err.contains("overrides the inherited 'branch'"), "{err}");
+
+        // extends: unknown parent
+        write(
+            r#"
+[iba-prod]
+extends = "nope"
+secrets = ["a"]
+ttl = "1h"
+"#,
+        );
+        let err = Profile::load("iba-prod").unwrap_err().to_string();
+        assert!(err.contains("extends unknown profile 'nope'"), "{err}");
+
+        // extends: cycle detection
+        write(
+            r#"
+[a]
+extends = "b"
+secrets = ["x"]
+ttl = "1h"
+
+[b]
+extends = "a"
+secrets = ["x"]
+ttl = "1h"
+"#,
+        );
+        let err = Profile::load("a").unwrap_err().to_string();
+        assert!(err.contains("inheritance cycle"), "{err}");
 
         unsafe {
             match prev {
