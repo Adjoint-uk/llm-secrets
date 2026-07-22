@@ -114,6 +114,20 @@ gets you a list of secret *names*, not values. Under the hood, `profile
 exec` mints a short-lived macaroon and uses it for the `exec` — but you
 never need to think about that.
 
+A profile can `extend` another to avoid repeating itself:
+
+```toml
+[iba-prod]
+extends = "iba"          # inherits iba's secrets, env, ttl
+ttl     = "1h"            # may only shorten the parent's ttl, never lengthen
+branch  = "main"          # may only add a caveat the parent left unset
+```
+
+Inheritance is additive-only, same rule as macaroon caveats: a child
+profile can narrow what it inherits (fewer secrets, shorter ttl, an
+extra `repo`/`branch`/`agent` restriction) but can never widen or
+override something the parent already restricts.
+
 ### That's it
 
 For use case 1, the commands you'll type are:

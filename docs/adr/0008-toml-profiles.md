@@ -227,7 +227,10 @@ These are mentioned for context only. Each will get its own ADR if and when need
 - `EnvMap` caveat for fully self-contained portable profiles (cross-machine delegation)
 - ~~Glob support in `repo` matcher (`adjoint/*`) — Phase 1 is exact match only~~
   **Shipped** — see `glob_match` in `src/macaroon.rs` (#22)
-- Hierarchical profiles / inheritance (`iba-prod extends iba`)
+- ~~Hierarchical profiles / inheritance (`iba-prod extends iba`)~~
+  **Shipped** — see `resolve()` in `src/profile.rs` (#20). Additive-only:
+  `secrets` may narrow to a subset, `ttl` may shorten, `repo`/`branch`/`agent`
+  may only be added if the parent left them unset — never overridden.
 - Auto-cache of recently-minted macaroons to avoid re-mint cost on hot paths
 - Maximum-TTL enforcement as a session policy
 
