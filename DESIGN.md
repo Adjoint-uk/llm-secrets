@@ -33,6 +33,15 @@ Deliberately *not* filed as issues: these are directions, not scheduled work.
 Each gets picked up when there's a forcing function, and becomes an ADR before
 any code lands.
 
+- **SPIFFE/SPIRE-aligned workload attestation.** The actual open standard for
+  this problem — cryptographically attested, short-lived workload identity
+  (X.509-SVID / JWT-SVID) issued per-workload rather than trusted by virtue of
+  the calling OS session. Today "who can mint" means "whoever is logged into
+  this local session," which holds up fine on one laptop but stops holding
+  once minting can happen from a remote or cloud-run agent session (Claude
+  Code supports both). A SPIFFE SVID composes the same way a vendor-OIDC token
+  would — just another caveat type. **Forcing function**: the day a non-local
+  (cloud/remote) session needs to mint.
 - **Vendor OIDC tokens (Sigstore pattern).** Anthropic / Cursor / Microsoft run
   an OIDC issuer for their dev tools; `llms` verifies the JWT against their
   JWKS. Composes naturally as a caveat type. **Blocked on vendor cooperation** —
