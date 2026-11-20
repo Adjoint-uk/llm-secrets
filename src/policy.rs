@@ -204,6 +204,7 @@ mod tests {
             repo: repo.into(),
             branch: branch.into(),
             agent: agent.into(),
+            request: None,
         }
     }
 
