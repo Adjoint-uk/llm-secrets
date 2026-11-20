@@ -125,6 +125,28 @@ pub enum Caveat {
     AgentEq(String),
     /// Token only valid for this user (matches `git config user.email`).
     WhoEq(String),
+
+    // ---- request-scoped caveats ----------------------------------------
+    // Evaluated by a credential proxy against the outbound HTTP request it is about to
+    // forward (`Context::request`). Every other caller (`exec`, leases, MCP) has no request,
+    // so a token carrying any of these cannot release a secret except through the proxy.
+    /// The request's host must be one of these (case-insensitive, exact, no port).
+    HostIn(Vec<String>),
+    /// The request's method must be one of these (case-insensitive).
+    MethodIn(Vec<String>),
+    /// The request's path must match this glob. `*` matches within one path segment; a segment
+    /// that is exactly `**` matches zero or more whole segments. A trailing slash is significant.
+    PathGlob(String),
+    /// A JSON body field, addressed by an RFC 6901 pointer, must equal this value.
+    BodyEq {
+        pointer: String,
+        value: serde_json::Value,
+    },
+    /// A JSON body string field, addressed by an RFC 6901 pointer, must match this glob
+    /// (`*` matches any sequence).
+    BodyGlob { pointer: String, glob: String },
+    /// The JSON body must be an object whose top-level keys are all in this list (no extra fields).
+    BodyKeysIn(Vec<String>),
 }
 
 /// Context against which caveats are evaluated. Always built fresh via
@@ -136,6 +158,8 @@ pub struct Context<'a> {
     pub repo: String,
     pub branch: String,
     pub agent: String,
+    /// The outbound request being authorised. Only a credential proxy sets this.
+    pub request: Option<RequestCtx>,
 }
 
 impl<'a> Context<'a> {
@@ -150,6 +174,7 @@ impl<'a> Context<'a> {
             repo: detect_repo(),
             branch: git("rev-parse", &["--abbrev-ref", "HEAD"]).unwrap_or_default(),
             agent: agent::detect_or_none(),
+            request: None,
         }
     }
 }
@@ -176,6 +201,63 @@ impl Caveat {
             Caveat::BranchEq(b) => eq_or_err("branch", &ctx.branch, b),
             Caveat::AgentEq(a) => eq_or_err("agent", &ctx.agent, a),
             Caveat::WhoEq(w) => eq_or_err("who", &ctx.who, w),
+            Caveat::HostIn(list) => {
+                let r = need_request(ctx, "host_in")?;
+                if list.iter().any(|h| h.eq_ignore_ascii_case(&r.host)) {
+                    Ok(())
+                } else {
+                    Err(format!("host_in: '{}' not in {:?}", r.host, list))
+                }
+            }
+            Caveat::MethodIn(list) => {
+                let r = need_request(ctx, "method_in")?;
+                if list.iter().any(|m| m.eq_ignore_ascii_case(&r.method)) {
+                    Ok(())
+                } else {
+                    Err(format!("method_in: '{}' not in {:?}", r.method, list))
+                }
+            }
+            Caveat::PathGlob(pattern) => {
+                let r = need_request(ctx, "path_glob")?;
+                if path_glob_match(pattern, &r.path) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "path_glob: '{}' does not match '{}'",
+                        r.path, pattern
+                    ))
+                }
+            }
+            Caveat::BodyEq { pointer, value } => {
+                let body = need_body(need_request(ctx, "body_eq")?, "body_eq", pointer)?;
+                match body.pointer(pointer) {
+                    Some(v) if v == value => Ok(()),
+                    Some(_) => Err(format!("body_eq: {pointer} does not equal {value}")),
+                    None => Err(format!("body_eq: {pointer} is missing")),
+                }
+            }
+            Caveat::BodyGlob { pointer, glob } => {
+                let body = need_body(need_request(ctx, "body_glob")?, "body_glob", pointer)?;
+                match body.pointer(pointer).and_then(|v| v.as_str()) {
+                    Some(s) if glob_match(glob, s) => Ok(()),
+                    Some(_) => Err(format!("body_glob: {pointer} does not match '{glob}'")),
+                    None => Err(format!("body_glob: {pointer} is missing or not a string")),
+                }
+            }
+            Caveat::BodyKeysIn(keys) => {
+                let r = need_request(ctx, "body_keys_in")?;
+                match r.body.as_ref() {
+                    Some(serde_json::Value::Object(map)) => {
+                        for k in map.keys() {
+                            if !keys.iter().any(|allowed| allowed == k) {
+                                return Err(format!("body_keys_in: field '{k}' is not allowed"));
+                            }
+                        }
+                        Ok(())
+                    }
+                    _ => Err("body_keys_in: request body is not a JSON object".to_string()),
+                }
+            }
         }
     }
 
@@ -199,8 +281,123 @@ impl Caveat {
             Caveat::BranchEq(b) => format!("branch == {b}"),
             Caveat::AgentEq(a) => format!("agent == {a}"),
             Caveat::WhoEq(w) => format!("user == {w}"),
+            Caveat::HostIn(l) => format!("request host in {l:?}"),
+            Caveat::MethodIn(l) => format!("request method in {l:?}"),
+            Caveat::PathGlob(p) => format!("request path ~ {p}"),
+            Caveat::BodyEq { pointer, value } => format!("body {pointer} == {value}"),
+            Caveat::BodyGlob { pointer, glob } => format!("body {pointer} ~ {glob}"),
+            Caveat::BodyKeysIn(k) => format!("body fields only {k:?}"),
         }
     }
+}
+
+/// The outbound HTTP request a credential proxy is about to forward. Built only by the proxy.
+/// Construction normalises and validates, so the request-scoped caveats never see an ambiguous
+/// host or path: anything that could be read two ways is refused before it is checked.
+#[derive(Debug, Clone)]
+pub struct RequestCtx {
+    /// Lower-case host, no port.
+    pub host: String,
+    /// Upper-case method.
+    pub method: String,
+    /// Path only (no query or fragment), validated.
+    pub path: String,
+    /// Parsed JSON body, if the request has one.
+    pub body: Option<serde_json::Value>,
+}
+
+impl RequestCtx {
+    // Unused until the credential proxy lands (docs/request-scoped-caveats.md, phase 2).
+    #[allow(dead_code)]
+    pub fn new(
+        host: &str,
+        method: &str,
+        target: &str,
+        body: Option<serde_json::Value>,
+    ) -> std::result::Result<Self, String> {
+        let host = host.trim().to_ascii_lowercase();
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return Err(format!("invalid host '{host}'"));
+        }
+        let method = method.trim().to_ascii_uppercase();
+        if method.is_empty() || !method.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Err(format!("invalid method '{method}'"));
+        }
+        let path = target.split(['?', '#']).next().unwrap_or("").to_string();
+        if !path.starts_with('/') {
+            return Err("path must start with '/'".to_string());
+        }
+        let lower = path.to_ascii_lowercase();
+        if path.contains('\\')
+            || path.contains("//")
+            || lower.contains("%2e")
+            || lower.contains("%2f")
+            || lower.contains("%5c")
+            || lower.contains("%00")
+        {
+            return Err("ambiguous or encoded path".to_string());
+        }
+        if path.split('/').any(|s| s == ".." || s == ".") {
+            return Err("path traversal".to_string());
+        }
+        Ok(Self {
+            host,
+            method,
+            path,
+            body,
+        })
+    }
+}
+
+fn need_request<'r>(
+    ctx: &'r Context<'_>,
+    name: &str,
+) -> std::result::Result<&'r RequestCtx, String> {
+    ctx.request.as_ref().ok_or_else(|| {
+        format!(
+            "{name}: no request context (this token is only valid through the credential proxy)"
+        )
+    })
+}
+
+fn need_body<'r>(
+    r: &'r RequestCtx,
+    name: &str,
+    pointer: &str,
+) -> std::result::Result<&'r serde_json::Value, String> {
+    if !pointer.starts_with('/') {
+        return Err(format!("{name}: invalid JSON pointer '{pointer}'"));
+    }
+    r.body
+        .as_ref()
+        .ok_or_else(|| format!("{name}: request has no JSON body"))
+}
+
+/// Path glob. Segments are split on `/`. Within a segment `*` matches any sequence but never
+/// crosses a `/`; a segment that is exactly `**` matches zero or more whole segments. Strict:
+/// `/orgs/x/repos/` (trailing slash) does not match `/orgs/*/repos`.
+fn path_glob_match(pattern: &str, path: &str) -> bool {
+    fn walk(p: &[&str], s: &[&str]) -> bool {
+        match p.split_first() {
+            None => s.is_empty(),
+            Some((seg, rest)) if *seg == "**" => (0..=s.len()).any(|i| walk(rest, &s[i..])),
+            Some((seg, rest)) => match s.split_first() {
+                Some((first, srest)) => glob_match(seg, first) && walk(rest, srest),
+                None => false,
+            },
+        }
+    }
+    let p: Vec<&str> = pattern
+        .strip_prefix('/')
+        .unwrap_or(pattern)
+        .split('/')
+        .collect();
+    let s: Vec<&str> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
+    walk(&p, &s)
 }
 
 fn eq_or_err(field: &str, actual: &str, expected: &str) -> std::result::Result<(), String> {
@@ -559,6 +756,7 @@ mod tests {
             repo: "acme/billing".into(),
             branch: "main".into(),
             agent: "claude-code".into(),
+            request: None,
         }
     }
 
@@ -659,6 +857,167 @@ mod tests {
         assert!(parse_duration("").is_err());
     }
 
+    fn rctx(
+        host: &str,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Context<'static> {
+        let mut c = ctx_for("x");
+        c.request = Some(RequestCtx::new(host, method, path, body).unwrap());
+        c
+    }
+
+    #[test]
+    fn request_caveats_fail_without_request_context() {
+        for c in [
+            Caveat::HostIn(vec!["a.com".into()]),
+            Caveat::MethodIn(vec!["GET".into()]),
+            Caveat::PathGlob("/**".into()),
+            Caveat::BodyEq {
+                pointer: "/a".into(),
+                value: serde_json::json!(1),
+            },
+            Caveat::BodyGlob {
+                pointer: "/a".into(),
+                glob: "*".into(),
+            },
+            Caveat::BodyKeysIn(vec![]),
+        ] {
+            let e = c.check(&ctx_for("x")).unwrap_err();
+            assert!(e.contains("no request context"), "{e}");
+        }
+    }
+
+    #[test]
+    fn host_and_method_caveats() {
+        let c = rctx("API.Example.com", "get", "/v1", None);
+        assert!(
+            Caveat::HostIn(vec!["api.example.com".into()])
+                .check(&c)
+                .is_ok()
+        );
+        assert!(
+            Caveat::HostIn(vec!["example.com".into()])
+                .check(&c)
+                .is_err()
+        );
+        assert!(
+            Caveat::MethodIn(vec!["GET".into(), "HEAD".into()])
+                .check(&c)
+                .is_ok()
+        );
+        assert!(Caveat::MethodIn(vec!["POST".into()]).check(&c).is_err());
+    }
+
+    #[test]
+    fn path_glob_semantics() {
+        let m = |p: &str, path: &str| path_glob_match(p, path);
+        assert!(m("/orgs/*/repos", "/orgs/acme/repos"));
+        assert!(!m("/orgs/*/repos", "/orgs/a/b/repos")); // * stays within a segment
+        assert!(!m("/orgs/*/repos", "/orgs/acme/repos/")); // trailing slash significant
+        assert!(m("/v1/**", "/v1"));
+        assert!(m("/v1/**", "/v1/a/b/c"));
+        assert!(!m("/v1/**", "/v2/a"));
+        assert!(m("/a/**/z", "/a/z"));
+        assert!(m("/a/**/z", "/a/b/c/z"));
+        assert!(m("/user/repos", "/user/repos"));
+        assert!(!m("/user/repos", "/user/repos2"));
+    }
+
+    #[test]
+    fn body_caveats() {
+        let body = serde_json::json!({"name": "proj-1", "private": true, "nested": {"k": "v"}});
+        let c = rctx("a.com", "POST", "/", Some(body));
+        let eq = |p: &str, v: serde_json::Value| Caveat::BodyEq {
+            pointer: p.into(),
+            value: v,
+        };
+        assert!(eq("/private", serde_json::json!(true)).check(&c).is_ok());
+        assert!(eq("/private", serde_json::json!(false)).check(&c).is_err());
+        assert!(eq("/missing", serde_json::json!(true)).check(&c).is_err());
+        assert!(eq("/nested/k", serde_json::json!("v")).check(&c).is_ok());
+        let glob = |p: &str, g: &str| Caveat::BodyGlob {
+            pointer: p.into(),
+            glob: g.into(),
+        };
+        assert!(glob("/name", "proj-*").check(&c).is_ok());
+        assert!(glob("/name", "other-*").check(&c).is_err());
+        assert!(glob("/private", "*").check(&c).is_err()); // not a string
+        assert!(eq("private", serde_json::json!(true)).check(&c).is_err()); // bad pointer
+        assert!(
+            Caveat::BodyKeysIn(vec!["name".into(), "private".into(), "nested".into()])
+                .check(&c)
+                .is_ok()
+        );
+        let e = Caveat::BodyKeysIn(vec!["name".into()])
+            .check(&c)
+            .unwrap_err();
+        assert!(!e.contains("proj-1")); // errors never echo body values
+        // no body at all
+        let nb = rctx("a.com", "GET", "/", None);
+        assert!(eq("/a", serde_json::json!(1)).check(&nb).is_err());
+        assert!(Caveat::BodyKeysIn(vec![]).check(&nb).is_err());
+    }
+
+    #[test]
+    fn request_ctx_rejects_ambiguous_input() {
+        let ok = |h: &str, m: &str, t: &str| RequestCtx::new(h, m, t, None).is_ok();
+        assert!(ok("api.github.com", "GET", "/a/b?x=1#f"));
+        assert!(!ok("", "GET", "/"));
+        assert!(!ok("a.com:8080", "GET", "/"));
+        assert!(!ok("user@a.com", "GET", "/"));
+        assert!(!ok("a.com/x", "GET", "/"));
+        assert!(!ok("a b.com", "GET", "/"));
+        assert!(!ok("a.com", "G3T", "/"));
+        assert!(!ok("a.com", "", "/"));
+        assert!(!ok("a.com", "GET", "a/b"));
+        assert!(!ok("a.com", "GET", "/a/../b"));
+        assert!(!ok("a.com", "GET", "/a/./b"));
+        assert!(!ok("a.com", "GET", "/a//b"));
+        assert!(!ok("a.com", "GET", "/a/%2e%2e/b"));
+        assert!(!ok("a.com", "GET", "/a%2Fb"));
+        assert!(!ok("a.com", "GET", "/a\\b"));
+        assert!(!ok("a.com", "GET", "/a%00"));
+        // query is stripped before the path is judged
+        let r = RequestCtx::new("a.com", "get", "/x?next=//evil", None).unwrap();
+        assert_eq!((r.path.as_str(), r.method.as_str()), ("/x", "GET"));
+    }
+
+    #[test]
+    fn request_caveats_round_trip_and_canonical() {
+        let cs = vec![
+            Caveat::HostIn(vec!["a.com".into()]),
+            Caveat::BodyEq {
+                pointer: "/a".into(),
+                value: serde_json::json!({"y": 1, "x": 2}),
+            },
+            Caveat::BodyGlob {
+                pointer: "/n".into(),
+                glob: "p-*".into(),
+            },
+        ];
+        for c in cs {
+            let j = serde_json::to_string(&c).unwrap();
+            let back: Caveat = serde_json::from_str(&j).unwrap();
+            assert_eq!(c, back);
+            assert_eq!(
+                c.canonical_bytes().unwrap(),
+                back.canonical_bytes().unwrap()
+            );
+            assert!(!c.describe().is_empty());
+        }
+        let a = Caveat::BodyEq {
+            pointer: "/a".into(),
+            value: serde_json::json!({"y": 1, "x": 2}),
+        };
+        let b = Caveat::BodyEq {
+            pointer: "/a".into(),
+            value: serde_json::json!({"x": 2, "y": 1}),
+        };
+        assert_eq!(a.canonical_bytes().unwrap(), b.canonical_bytes().unwrap());
+    }
+
     /// Tamper detection + escalation prevention. Both properties live in
     /// one test to serialise the env mutation against itself (parallel
     /// test runs would race on $LLM_SECRETS_DIR otherwise).
@@ -729,6 +1088,65 @@ mod tests {
         let mut wider = child.clone();
         wider.caveats.pop();
         assert!(wider.verify(&ctx).is_err());
+
+        // ---- Property 4: request-scoped caveats ------------------------
+        // Delegated narrowing works through the proxy; the same token is useless without a request.
+        let scoped = mint_with_caveats(vec![Caveat::SecretEq("db".into())])
+            .unwrap()
+            .delegate(vec![
+                Caveat::HostIn(vec!["api.github.com".into()]),
+                Caveat::MethodIn(vec!["POST".into()]),
+                Caveat::PathGlob("/orgs/*/repos".into()),
+                Caveat::BodyEq {
+                    pointer: "/private".into(),
+                    value: serde_json::json!(true),
+                },
+                Caveat::BodyKeysIn(vec!["name".into(), "private".into()]),
+            ])
+            .unwrap();
+        let req = |host: &str, path: &str, body: serde_json::Value| {
+            let mut c = ctx_for("db");
+            c.request = Some(RequestCtx::new(host, "post", path, Some(body)).unwrap());
+            c
+        };
+        scoped
+            .verify(&req(
+                "API.github.com",
+                "/orgs/acme/repos?x=1",
+                serde_json::json!({"name": "r", "private": true}),
+            ))
+            .unwrap();
+        // Public repo, extra field, wrong host, wrong path: each denied.
+        for (h, pa, b) in [
+            (
+                "api.github.com",
+                "/orgs/acme/repos",
+                serde_json::json!({"name": "r", "private": false}),
+            ),
+            (
+                "api.github.com",
+                "/orgs/acme/repos",
+                serde_json::json!({"name": "r", "private": true, "x": 1}),
+            ),
+            (
+                "evil.example",
+                "/orgs/acme/repos",
+                serde_json::json!({"private": true}),
+            ),
+            (
+                "api.github.com",
+                "/orgs/acme/members",
+                serde_json::json!({"private": true}),
+            ),
+        ] {
+            assert!(scoped.verify(&req(h, pa, b)).is_err());
+        }
+        // No request context (exec, leases, MCP): cannot release the secret.
+        assert!(scoped.verify(&ctx_for("db")).is_err());
+        // Stripping a request caveat breaks the chain.
+        let mut widened = scoped.clone();
+        widened.caveats.pop();
+        assert!(widened.verify(&ctx_for("db")).is_err());
 
         unsafe {
             match prev {
