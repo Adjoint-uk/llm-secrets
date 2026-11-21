@@ -302,6 +302,70 @@ WHEN TO USE PROFILES VS MANUAL MACAROON MINT
         #[command(subcommand)]
         action: ProfileCommand,
     },
+
+    /// Credential proxy: the agent holds only a macaroon, the proxy holds the secret
+    #[command(long_about = "\
+The agent never holds a real credential. It calls the proxy at
+http://127.0.0.1:PORT/<service>/<upstream path> carrying only a macaroon
+(Authorization: Bearer <macaroon>, or X-Llms-Token). The proxy checks the
+macaroon against the request it is about to send, swaps in the real
+credential from the store, forwards over HTTPS, and audits.
+
+Services live in ~/.config/llm-secrets/proxy.toml (see docs/PROXY.md):
+
+  [services.github]
+  upstream = \"https://api.github.com\"
+  secret   = \"github_token\"
+  inject   = \"bearer\"        # or \"basic\", or \"header\" + header = \"X-Api-Key\"
+
+EXAMPLES
+
+  llms proxy check --service github          # validate config, no serving
+  llms proxy serve                           # 127.0.0.1:8787
+
+  M=$(llms macaroon mint --secret github_token --ttl 10m \\
+      --method GET --path '/repos/adjoint-uk/*')
+  curl -H \"Authorization: Bearer $M\" http://127.0.0.1:8787/github/repos/adjoint-uk/llm-secrets
+
+The proxy is loopback-only unless you pass --allow-non-loopback. Start it
+from the repo and branch you minted in: the repo, branch, agent and user
+caveats are evaluated against the proxy's own environment.
+")]
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProxyCommand {
+    /// Run the proxy
+    Serve {
+        /// Address to listen on (loopback unless --allow-non-loopback)
+        #[arg(long, default_value = crate::proxy::DEFAULT_BIND)]
+        bind: String,
+        /// Services file (default: proxy.toml in the llms config dir)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Allow binding a non-loopback address (prints a warning; no TLS)
+        #[arg(long)]
+        allow_non_loopback: bool,
+        /// Allow http:// upstreams, for loopback hosts only (local development)
+        #[arg(long)]
+        allow_loopback_http: bool,
+    },
+    /// Validate the services file and that each secret exists, without serving
+    Check {
+        /// Check only this service (default: all)
+        #[arg(long)]
+        service: Option<String>,
+        /// Services file (default: proxy.toml in the llms config dir)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Allow http:// upstreams, for loopback hosts only
+        #[arg(long)]
+        allow_loopback_http: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -339,6 +403,9 @@ enum ProfileCommand {
     },
 }
 
+// Built once per invocation by clap and consumed immediately, so the size gap between
+// `Mint` and the other variants is irrelevant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum MacaroonCommand {
     /// Mint a fresh macaroon scoped by the given caveats.
@@ -362,6 +429,9 @@ enum MacaroonCommand {
         /// Restrict to a specific user (matches session.who).
         #[arg(long)]
         who: Option<String>,
+
+        #[command(flatten)]
+        request: RequestScope,
     },
 
     /// Decode and pretty-print a macaroon. Pure parse — never touches the
@@ -431,9 +501,28 @@ pub fn run() -> Result<()> {
                 branch,
                 agent,
                 who,
-            } => cmd_macaroon_mint(secret, &ttl, repo, branch, agent, who),
+                request,
+            } => cmd_macaroon_mint(secret, &ttl, repo, branch, agent, who, request),
             MacaroonCommand::Inspect { macaroon } => cmd_macaroon_inspect(macaroon),
             MacaroonCommand::Verify { macaroon, key } => cmd_macaroon_verify(macaroon, key),
+        },
+        Command::Proxy { action } => match action {
+            ProxyCommand::Serve {
+                bind,
+                config,
+                allow_non_loopback,
+                allow_loopback_http,
+            } => crate::proxy::serve(
+                &bind,
+                config.as_deref(),
+                allow_non_loopback,
+                allow_loopback_http,
+            ),
+            ProxyCommand::Check {
+                service,
+                config,
+                allow_loopback_http,
+            } => crate::proxy::check(service.as_deref(), config.as_deref(), allow_loopback_http),
         },
         Command::Profile { action } => match action {
             ProfileCommand::List => cmd_profile_list(),
@@ -791,6 +880,85 @@ fn cmd_revoke_all(rotate: bool) -> Result<()> {
 
 // ---- macaroon (delegation) commands --------------------------------------
 
+/// Request-scoped caveats given on the `macaroon mint` command line. Only `llms proxy` can
+/// satisfy them; any other caller has no request, so it fails closed.
+#[derive(clap::Args)]
+struct RequestScope {
+    /// Proxy only: allowed upstream host (repeatable)
+    #[arg(long)]
+    host: Vec<String>,
+    /// Proxy only: allowed HTTP method (repeatable, e.g. GET)
+    #[arg(long)]
+    method: Vec<String>,
+    /// Proxy only: allowed path glob (`*` within a segment, `**` across segments)
+    #[arg(long)]
+    path: Option<String>,
+    /// Proxy only: JSON body field must equal a value, as POINTER=JSON (repeatable),
+    /// e.g. --body-eq /private=true
+    #[arg(long = "body-eq")]
+    body_eq: Vec<String>,
+    /// Proxy only: JSON body string field must match a glob, as POINTER=GLOB (repeatable)
+    #[arg(long = "body-glob")]
+    body_glob: Vec<String>,
+    /// Proxy only: JSON body may contain only these top-level keys (repeatable)
+    #[arg(long = "body-key")]
+    body_key: Vec<String>,
+}
+
+impl RequestScope {
+    fn into_caveats(self) -> Result<Vec<crate::macaroon::Caveat>> {
+        use crate::macaroon::Caveat;
+        let mut out = Vec::new();
+        if !self.host.is_empty() {
+            out.push(Caveat::HostIn(self.host));
+        }
+        if !self.method.is_empty() {
+            out.push(Caveat::MethodIn(
+                self.method
+                    .into_iter()
+                    .map(|m| m.to_ascii_uppercase())
+                    .collect(),
+            ));
+        }
+        if let Some(p) = self.path {
+            if !p.starts_with('/') {
+                return Err(Error::Other("--path must start with '/'".into()));
+            }
+            out.push(Caveat::PathGlob(p));
+        }
+        for spec in self.body_eq {
+            let (pointer, raw) = split_pointer_spec("--body-eq", &spec)?;
+            let value = serde_json::from_str(raw).map_err(|e| {
+                Error::Other(format!("--body-eq {spec:?}: value is not valid JSON ({e})"))
+            })?;
+            out.push(Caveat::BodyEq { pointer, value });
+        }
+        for spec in self.body_glob {
+            let (pointer, glob) = split_pointer_spec("--body-glob", &spec)?;
+            out.push(Caveat::BodyGlob {
+                pointer,
+                glob: glob.to_string(),
+            });
+        }
+        if !self.body_key.is_empty() {
+            out.push(Caveat::BodyKeysIn(self.body_key));
+        }
+        Ok(out)
+    }
+}
+
+fn split_pointer_spec<'a>(flag: &str, spec: &'a str) -> Result<(String, &'a str)> {
+    let (pointer, rest) = spec
+        .split_once('=')
+        .ok_or_else(|| Error::Other(format!("{flag} expects POINTER=VALUE, got {spec:?}")))?;
+    if !pointer.starts_with('/') {
+        return Err(Error::Other(format!(
+            "{flag}: JSON pointer must start with '/', got {pointer:?}"
+        )));
+    }
+    Ok((pointer.to_string(), rest))
+}
+
 fn cmd_macaroon_mint(
     secret: Vec<String>,
     ttl: &str,
@@ -798,6 +966,7 @@ fn cmd_macaroon_mint(
     branch: Option<String>,
     agent: Option<String>,
     who: Option<String>,
+    request: RequestScope,
 ) -> Result<()> {
     let dur = crate::macaroon::parse_duration(ttl)?;
     let mut extras: Vec<crate::macaroon::Caveat> = Vec::new();
@@ -827,6 +996,7 @@ fn cmd_macaroon_mint(
     if let Some(w) = who {
         extras.push(crate::macaroon::Caveat::WhoEq(w));
     }
+    extras.extend(request.into_caveats()?);
 
     // Delegation derives the child token from the dev's root macaroon.
     // The agent inherits a *narrower* slice of the dev's identity.
