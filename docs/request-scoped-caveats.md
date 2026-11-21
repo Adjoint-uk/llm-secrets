@@ -1,6 +1,6 @@
 # Request-scoped caveats and the credential proxy
 
-Status: phase 1 (caveats) implemented; phase 2 (proxy) not yet.
+Status: phase 1 (caveats) and phase 2 (route-mode proxy) implemented.
 
 ## Problem
 
@@ -43,17 +43,45 @@ Does not defend against: a compromised proxy host; an allowed endpoint that is i
 header-based or non-JSON bodies (rejected by body caveats rather than guessed at); the holder of a plain,
 non-request-scoped token.
 
-## Phase 2: `llms proxy` (needs decisions)
+## Phase 2: `llms proxy` (route mode)
 
-The proxy holds the secrets and the root key, accepts requests from the agent carrying only a macaroon, verifies it with
-the request context, injects the real credential, forwards, and logs to `llms audit`. The agent never sees the secret.
+`llms proxy serve [--bind ADDR:PORT] [--config PATH]` (default `127.0.0.1:8787`). The agent calls
+`http://127.0.0.1:PORT/<service>/<upstream path>` with `Authorization: Bearer <macaroon>` (or `X-Llms-Token`).
+No TLS interception, no local CA.
 
-Open decisions:
+Services live in `services.toml` in the llms config dir (next to `profiles.toml`):
 
-- **Route mode** (agent calls `http://localhost:PORT/<service>/...`, simplest, no TLS interception) versus **MITM**
-  (works with unmodified tools, but needs a local CA and is a larger attack surface). Recommendation: route mode first.
-- New dependencies (HTTP server and client, TLS). Keep minimal; prefer a small blocking server plus `ureq`.
-- Credential mapping: which secret and which header (`Authorization: Bearer`, basic, custom) per upstream host.
+```toml
+max_body_bytes = 1048576      # optional, default 1 MiB
+connect_timeout_secs = 5      # optional
+timeout_secs = 30             # optional, total
+
+[services.github]
+upstream = "https://api.github.com"   # https only; the host is fixed here, never taken from the request
+secret   = "github_token"
+inject   = "bearer"                   # bearer | basic (secret is "user:pass") | header
+# header = "X-Api-Key"                # required with inject = "header"
+```
+
+Per request the proxy: validates the target (400 on anything `RequestCtx::new` refuses), requires a macaroon that
+carries `secret_eq`/`secrets_in`, caps and parses the body (JSON only for a JSON `Content-Type`, duplicate keys
+refused; otherwise body caveats see no body and fail closed), calls `Macaroon::verify` with a fresh `Context` whose
+`request` is the real request, injects the credential, forwards without following redirects, and audits. Every
+denial is a generic 403 (reason in the audit log only). `llms proxy check --service S` validates config and that the
+secret exists. `llms macaroon mint` gained `--host/--method/--path-glob/--body-eq/--body-glob/--body-keys` to mint
+request-scoped tokens.
+
+Notes and limits:
+
+- `path_glob` is matched against the agent-supplied path (after `/<service>`), not the configured base path.
+- `repo_eq`, `branch_eq`, `agent_eq`, `who_eq` are evaluated against the proxy process's environment
+  (`Context::current` per request), as for every other llms entry point.
+- Revocation: the proxy reads the root key on every request, so `revoke-all` and a new `session-start` kill tokens at once.
+- Audit entries (`proxy.allow` / `proxy.deny`) record service, method, upstream host, path (no query), decision and
+  the failing caveat name. Allows are written before forwarding, so `LLM_SECRETS_AUDIT_STRICT` fails closed.
+- Response headers that visibly echo the injected credential are dropped (best effort: encoded echoes and echoes in the
+  body are not detected). Responses are buffered (32 MiB cap).
+- Non-loopback binds need `--allow-non-loopback` and print a warning. Plain HTTP only.
 
 ## Phase 3: hub integration
 

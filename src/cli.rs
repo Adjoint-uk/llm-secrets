@@ -302,6 +302,55 @@ WHEN TO USE PROFILES VS MANUAL MACAROON MINT
         #[command(subcommand)]
         action: ProfileCommand,
     },
+
+    /// Local credential proxy: the agent holds only a macaroon, never the secret
+    #[command(long_about = "\
+Route-mode credential proxy. The agent calls
+http://127.0.0.1:PORT/<service>/<upstream path> with `Authorization: Bearer <macaroon>`
+(or `X-Llms-Token`). The proxy verifies the macaroon against the actual request (host,
+method, path, JSON body), swaps in the real credential from the store, forwards over
+HTTPS, and audits the decision. Services live in services.toml in the llms config dir:
+
+  [services.github]
+  upstream = \"https://api.github.com\"   # https only; the host is fixed here
+  secret   = \"github_token\"
+  inject   = \"bearer\"                   # bearer | basic | header (+ header = \"X-Api-Key\")
+
+The token must carry a secret_eq/secrets_in caveat for the service's secret. Binds
+127.0.0.1 by default. See docs/request-scoped-caveats.md.
+")]
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProxyCommand {
+    /// Serve the proxy
+    Serve {
+        /// Address to bind (default 127.0.0.1:8787)
+        #[arg(long)]
+        bind: Option<String>,
+        /// Services file (default: <config dir>/services.toml)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Allow binding a non-loopback address (plain HTTP; prints a warning)
+        #[arg(long)]
+        allow_non_loopback: bool,
+        /// Allow http:// upstreams. Testing only.
+        #[arg(long, hide = true)]
+        allow_insecure_upstream: bool,
+    },
+    /// Validate one service's config and that its secret exists, without serving
+    Check {
+        #[arg(long)]
+        service: String,
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        #[arg(long, hide = true)]
+        allow_insecure_upstream: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -340,6 +389,8 @@ enum ProfileCommand {
 }
 
 #[derive(Subcommand)]
+// Parsed once per process; boxing the flag-heavy `Mint` variant would only add noise.
+#[allow(clippy::large_enum_variant)]
 enum MacaroonCommand {
     /// Mint a fresh macaroon scoped by the given caveats.
     /// Requires an active session (the macaroon's root key lives there).
@@ -362,6 +413,26 @@ enum MacaroonCommand {
         /// Restrict to a specific user (matches session.who).
         #[arg(long)]
         who: Option<String>,
+        /// Request-scoped (proxy only): upstream host must be one of these (repeatable).
+        #[arg(long = "host")]
+        host: Vec<String>,
+        /// Request-scoped (proxy only): HTTP method must be one of these (repeatable).
+        #[arg(long = "method")]
+        method: Vec<String>,
+        /// Request-scoped (proxy only): path glob, e.g. '/repos/acme/*/issues'.
+        #[arg(long = "path-glob")]
+        path_glob: Option<String>,
+        /// Request-scoped (proxy only): JSON body field equals value, `POINTER=JSON`
+        /// (repeatable), e.g. '/private=true'.
+        #[arg(long = "body-eq")]
+        body_eq: Vec<String>,
+        /// Request-scoped (proxy only): JSON body string field matches glob,
+        /// `POINTER=GLOB` (repeatable), e.g. '/name=proj-*'.
+        #[arg(long = "body-glob")]
+        body_glob: Vec<String>,
+        /// Request-scoped (proxy only): body may only have these top-level keys (comma-separated).
+        #[arg(long = "body-keys", value_delimiter = ',')]
+        body_keys: Vec<String>,
     },
 
     /// Decode and pretty-print a macaroon. Pure parse — never touches the
@@ -431,9 +502,43 @@ pub fn run() -> Result<()> {
                 branch,
                 agent,
                 who,
-            } => cmd_macaroon_mint(secret, &ttl, repo, branch, agent, who),
+                host,
+                method,
+                path_glob,
+                body_eq,
+                body_glob,
+                body_keys,
+            } => cmd_macaroon_mint(
+                secret,
+                &ttl,
+                repo,
+                branch,
+                agent,
+                who,
+                RequestScope {
+                    host,
+                    method,
+                    path_glob,
+                    body_eq,
+                    body_glob,
+                    body_keys,
+                },
+            ),
             MacaroonCommand::Inspect { macaroon } => cmd_macaroon_inspect(macaroon),
             MacaroonCommand::Verify { macaroon, key } => cmd_macaroon_verify(macaroon, key),
+        },
+        Command::Proxy { action } => match action {
+            ProxyCommand::Serve {
+                bind,
+                config,
+                allow_non_loopback,
+                allow_insecure_upstream,
+            } => crate::proxy::serve(bind, config, allow_non_loopback, allow_insecure_upstream),
+            ProxyCommand::Check {
+                service,
+                config,
+                allow_insecure_upstream,
+            } => crate::proxy::check(&service, config, allow_insecure_upstream),
         },
         Command::Profile { action } => match action {
             ProfileCommand::List => cmd_profile_list(),
@@ -791,6 +896,25 @@ fn cmd_revoke_all(rotate: bool) -> Result<()> {
 
 // ---- macaroon (delegation) commands --------------------------------------
 
+/// Request-scoped caveat inputs for `macaroon mint` (only the credential proxy evaluates these).
+struct RequestScope {
+    host: Vec<String>,
+    method: Vec<String>,
+    path_glob: Option<String>,
+    body_eq: Vec<String>,
+    body_glob: Vec<String>,
+    body_keys: Vec<String>,
+}
+
+fn split_pointer_arg<'a>(flag: &str, arg: &'a str) -> Result<(&'a str, &'a str)> {
+    match arg.split_once('=') {
+        Some((p, v)) if p.starts_with('/') => Ok((p, v)),
+        _ => Err(Error::Other(format!(
+            "{flag} expects POINTER=VALUE with an RFC 6901 pointer starting with '/', got '{arg}'"
+        ))),
+    }
+}
+
 fn cmd_macaroon_mint(
     secret: Vec<String>,
     ttl: &str,
@@ -798,6 +922,7 @@ fn cmd_macaroon_mint(
     branch: Option<String>,
     agent: Option<String>,
     who: Option<String>,
+    scope: RequestScope,
 ) -> Result<()> {
     let dur = crate::macaroon::parse_duration(ttl)?;
     let mut extras: Vec<crate::macaroon::Caveat> = Vec::new();
@@ -826,6 +951,37 @@ fn cmd_macaroon_mint(
     }
     if let Some(w) = who {
         extras.push(crate::macaroon::Caveat::WhoEq(w));
+    }
+    if !scope.host.is_empty() {
+        extras.push(crate::macaroon::Caveat::HostIn(scope.host));
+    }
+    if !scope.method.is_empty() {
+        extras.push(crate::macaroon::Caveat::MethodIn(scope.method));
+    }
+    if let Some(g) = scope.path_glob {
+        extras.push(crate::macaroon::Caveat::PathGlob(g));
+    }
+    for arg in &scope.body_eq {
+        let (pointer, raw) = split_pointer_arg("--body-eq", arg)?;
+        let value = serde_json::from_str(raw).map_err(|e| {
+            Error::Other(format!(
+                "--body-eq value must be JSON (quote strings, e.g. '/name=\"x\"'): {e}"
+            ))
+        })?;
+        extras.push(crate::macaroon::Caveat::BodyEq {
+            pointer: pointer.to_string(),
+            value,
+        });
+    }
+    for arg in &scope.body_glob {
+        let (pointer, glob) = split_pointer_arg("--body-glob", arg)?;
+        extras.push(crate::macaroon::Caveat::BodyGlob {
+            pointer: pointer.to_string(),
+            glob: glob.to_string(),
+        });
+    }
+    if !scope.body_keys.is_empty() {
+        extras.push(crate::macaroon::Caveat::BodyKeysIn(scope.body_keys));
     }
 
     // Delegation derives the child token from the dev's root macaroon.

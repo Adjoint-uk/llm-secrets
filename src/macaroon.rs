@@ -307,8 +307,6 @@ pub struct RequestCtx {
 }
 
 impl RequestCtx {
-    // Unused until the credential proxy lands (docs/request-scoped-caveats.md, phase 2).
-    #[allow(dead_code)]
     pub fn new(
         host: &str,
         method: &str,

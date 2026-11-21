@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- **`llms proxy`: credential proxy, route mode** (#48, closes #46). `llms proxy serve` / `llms proxy check`. The agent holds only a macaroon; the proxy verifies it against the real request (request-scoped caveats from #47), injects the secret from the store, forwards over HTTPS without following redirects, and audits. `llms macaroon mint` gains `--host/--method/--path-glob/--body-eq/--body-glob/--body-keys`. New dependencies: `ureq`, `tiny_http`. See `docs/request-scoped-caveats.md`.
 - **Profile inheritance — `extends`** (#20, ADR 0008 Phase 2). A profile can `extends = "parent"` to inherit its `secrets`, `env`, `ttl`, and `repo`/`branch`/`agent` caveats. Additive-only: `secrets` may narrow to a subset of the parent's, `ttl` may shorten but never lengthen, and `repo`/`branch`/`agent` may only be set by the child if the parent left them unset — never overridden. Cycles and unknown parents are rejected at load time.
 - **`profiles.d/` per-machine overrides** (#21, ADR 0008 Phase 2). Any `*.toml` file dropped in `~/.config/llm-secrets/profiles.d/` is layered on top of `profiles.toml`: a profile name defined there fully replaces the same-named entry (or adds a new machine-local profile). Meant for per-machine config that isn't dotfile-synced. The same name in two different `profiles.d` files is rejected as ambiguous; `profiles.toml` itself is now optional if `profiles.d/` alone defines at least one profile.
 
