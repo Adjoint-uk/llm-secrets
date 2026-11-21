@@ -227,9 +227,15 @@ Without a policy file, all secrets are accessible (backwards compatible).
 
 ## Status
 
-**v2.1 — released.** Adds **TOML profiles** — named recipes that group secrets and env-var mappings — so consuming many secrets from many tools no longer needs wrapper-script boilerplate. Profiles are config; the macaroons they produce at use time are still the unforgeable, time-bounded tokens. See [ADR 0008](docs/adr/0008-toml-profiles.md) for the design and [CHANGELOG](CHANGELOG.md) for the full notes.
+**v3.1 — released** ([GitHub releases](https://github.com/adjoint-uk/llm-secrets/releases), prebuilt binaries for Linux and macOS). Strict-mode and hygiene: `exec --leased` fails closed unless every injected secret holds a current lease; `LLM_SECRETS_AUDIT_STRICT=1` makes a failed audit write stop the operation; the `repo` caveat accepts globs (`adjoint/*`); and `profile show` warns about secrets missing from the store. See [ADR 0009](docs/adr/0009-no-mcp-write-tools.md), [ADR 0010](docs/adr/0010-fail-closed-audit.md) and the [CHANGELOG](CHANGELOG.md) for the full notes.
 
-Built on **v2.0**, the macaroon merge: the session and the delegated token are the **same primitive** — both are macaroons. Reads always travel through a verified token. See [ADR 0007](docs/adr/0007-macaroon-merge.md).
+Coming next, already on `main`: profile inheritance (`extends`) and per-machine `profiles.d/` overrides.
+
+Built on:
+
+- **v3.0** — XDG-compliant store location (`~/.local/share/llm-secrets/`).
+- **v2.1** — **TOML profiles**: named recipes that group secrets and env-var mappings. Profiles are config; the macaroons they produce at use time are still the unforgeable, time-bounded tokens. See [ADR 0008](docs/adr/0008-toml-profiles.md).
+- **v2.0** — the macaroon merge: the session and the delegated token are the **same primitive** — both are macaroons. Reads always travel through a verified token. See [ADR 0007](docs/adr/0007-macaroon-merge.md).
 
 ## Contributing
 
