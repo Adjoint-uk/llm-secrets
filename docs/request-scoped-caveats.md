@@ -1,6 +1,6 @@
 # Request-scoped caveats and the credential proxy
 
-Status: phase 1 (caveats) implemented; phase 2 (proxy) not yet.
+Status: phase 1 (caveats) and phase 2 (proxy, route mode) implemented; phase 3 (hub) not yet.
 
 ## Problem
 
@@ -43,17 +43,11 @@ Does not defend against: a compromised proxy host; an allowed endpoint that is i
 header-based or non-JSON bodies (rejected by body caveats rather than guessed at); the holder of a plain,
 non-request-scoped token.
 
-## Phase 2: `llms proxy` (needs decisions)
+## Phase 2: `llms proxy`
 
-The proxy holds the secrets and the root key, accepts requests from the agent carrying only a macaroon, verifies it with
-the request context, injects the real credential, forwards, and logs to `llms audit`. The agent never sees the secret.
-
-Open decisions:
-
-- **Route mode** (agent calls `http://localhost:PORT/<service>/...`, simplest, no TLS interception) versus **MITM**
-  (works with unmodified tools, but needs a local CA and is a larger attack surface). Recommendation: route mode first.
-- New dependencies (HTTP server and client, TLS). Keep minimal; prefer a small blocking server plus `ureq`.
-- Credential mapping: which secret and which header (`Authorization: Bearer`, basic, custom) per upstream host.
+Implemented in #48: route mode, the macaroon as placeholder, a services file for upstream and injection
+style, `ureq` + `tiny_http`. Usage is in [PROXY.md](PROXY.md); the decisions, limits and what is not covered are
+in [ADR 0011](adr/0011-credential-proxy.md).
 
 ## Phase 3: hub integration
 

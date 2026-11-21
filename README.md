@@ -176,6 +176,14 @@ When you're done — or if anything looks wrong — `llms revoke-all` deletes th
 | `llms profile exec <name> [--ttl <t>] -- <cmd>` | Mint + exec with the profile's env vars injected |
 | `llms exec --profile <name> -- <cmd>` | Alias for `profile exec` |
 
+### Credential proxy (the agent never holds the secret)
+
+| Command | Description |
+|---------|-------------|
+| `llms proxy serve [--bind ADDR:PORT]` | Local proxy: macaroon in, real credential injected, request audited |
+| `llms proxy check [--service <s>]` | Validate `proxy.toml` and that each secret exists, without serving |
+| `llms macaroon mint … --method GET --path '/repos/*'` | Request-scoped caveats the proxy enforces (see [PROXY.md](docs/PROXY.md)) |
+
 ## Policy File
 
 Create `.llm-secrets-policy.yaml` in your repo to control access by identity:
