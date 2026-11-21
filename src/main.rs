@@ -6,6 +6,7 @@ mod macaroon;
 mod mcp;
 mod policy;
 mod profile;
+mod proxy;
 mod store;
 
 fn main() {
